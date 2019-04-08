@@ -1,28 +1,33 @@
 import config
 import torch
 import torch.nn as nn
-import torch.functional as F
+import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
 
 class Encoder(nn.Module):
     def __init__(self, embeddings, vocab_size, embedding_size, hidden_size, dropout):
         super(Encoder, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embedding_size).from_pretrained(embeddings,
-                                                                                  freeze=True)
+
+        self.embedding = nn.Embedding(vocab_size, embedding_size)
+        if embeddings is not None:
+            self.embedding = nn.Embedding(vocab_size, embedding_size). \
+                from_pretrained(embeddings, freeze=True)
+
         self.lstm = nn.LSTM(embedding_size, hidden_size, dropout=dropout,
                             num_layers=2, bidirectional=True, batch_first=True)
 
     def forward(self, src_seq, src_len):
         embedded = self.embedding(src_seq)
-        b, t, d = embedded.size()
+
         packed = pack_padded_sequence(embedded, src_len, batch_first=True)
         outputs, states = self.lstm(packed)  # states : tuple of [4, b, d]
-        outputs = pad_packed_sequence(packed, batch_first=True)  # [b, t, d]
-
+        outputs, _ = pad_packed_sequence(outputs, batch_first=True)  # [b, t, d]
         h, c = states
+        _, b, d = h.size()
         h = h.view(2, 2, b, d)  # [n_layers, bi, b, d]
         h = torch.cat((h[:, 0, :, :], h[:, 1, :, :]), dim=-1)
+
         c = c.view(2, 2, b, d)
         c = torch.cat((c[:, 0, :, :], c[:, 1, :, :]), dim=-1)
         concat_states = (h, c)
@@ -35,6 +40,10 @@ class Decoder(nn.Module):
         super(Decoder, self).__init__()
         self.embedding = nn.Embedding(embedding_size, vocab_size).from_pretrained(embeddings,
                                                                                   freeze=True)
+        if embeddings is not None:
+            self.embedding = nn.Embedding(vocab_size, embedding_size). \
+                from_pretrained(embeddings, freeze=True)
+
         self.encoder_trans = nn.Linear(hidden_size, hidden_size)
         self.lstm = nn.LSTM(embedding_size, hidden_size, batch_first=True,
                             num_layers=2, bidirectional=False, dropout=dropout)
@@ -44,7 +53,7 @@ class Decoder(nn.Module):
     def attention(query, memories, mask):
         # query : [b, 1, d]
         energy = torch.matmul(query, memories.transpose(1, 2))  # [b, 1, t]
-        score = energy.squeeze(0).masked_fill(mask, value=-1e12)
+        score = energy.squeeze(1).masked_fill(mask, value=-1e12)
         score = F.softmax(score, dim=1).unsqueeze(dim=1)  # [b, 1, t]
         context_vector = torch.matmul(score, memories)  # [b, 1, d]
 
@@ -55,6 +64,7 @@ class Decoder(nn.Module):
 
     def forward(self, trg_seq, init_states, encoder_outputs, encoder_mask):
         # trg_seq : [b,t]
+        # init_states : [2,b,d]
         # encoder_outputs : [b,t,d]
         # init_states : a tuple of [2, b, d]
         max_len = trg_seq.size(1)
@@ -84,11 +94,11 @@ class Decoder(nn.Module):
         logit_input = torch.cat((output, context), dim=2).squeeze(dim=1)
         logit = self.logit_layer(logit_input)  # [b, |V|]
 
-        return logit
+        return logit, states
 
 
-class Seq2seq(object):
-    def __init__(self, enc_embedding, dec_embedding, is_eval=False, model_path=None):
+class Seq2seq(nn.Module):
+    def __init__(self, enc_embedding=None, dec_embedding=None, is_eval=False, model_path=None):
         super(Seq2seq, self).__init__()
         encoder = Encoder(enc_embedding, config.enc_vocab_size,
                           config.embedding_size, config.hidden_size,
@@ -96,9 +106,6 @@ class Seq2seq(object):
         decoder = Decoder(dec_embedding, config.dec_vocab_size,
                           config.embedding_size, 2 * config.hidden_size,
                           config.dropout)
-        if is_eval:
-            encoder = encoder.eval()
-            decoder = decoder.eval()
 
         if config.use_gpu and torch.cuda.is_available():
             device = torch.device(config.device)
@@ -108,7 +115,18 @@ class Seq2seq(object):
         self.encoder = encoder
         self.decoder = decoder
 
+        if is_eval:
+            self.eval_mode()
+
         if model_path is not None:
             ckpt = torch.load(model_path)
             self.encoder.load_state_dict(ckpt["encoder_state_dict"])
             self.decoder.load_state_dict(ckpt["decoder_state_dict"])
+
+    def eval_mode(self):
+        self.encoder = self.encoder.eval()
+        self.decoder = self.decoder.eval()
+
+    def train_mode(self):
+        self.encoder = self.encoder.train()
+        self.decoder = self.decoder.train()

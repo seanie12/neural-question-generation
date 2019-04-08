@@ -3,18 +3,26 @@ import torch
 import config
 import pickle
 import numpy as np
+import time
 
 PAD_TOKEN = "<PAD>"
 UNK_TOKEN = "<UNK>"
 START_TOKEN = "<SOS>"
 END_TOKEN = "<EOS>"
 
+PAD_ID = 0
+UNK_ID = 1
+START_ID = 2
+END_ID = 3
+
 
 class SQuadDataset(data.Dataset):
     def __init__(self, src_file, trg_file, max_length, src_word2idx, trg_word2idx, debug=False):
-        self.src = open(src_file, "r", encoding="utf-8").readlines()
-        self.trg = open(trg_file, "r", encoding="utf-8").readlines()
-        assert len(self.src) == len(self.trg), "the number of source sequence and target sequence must be the same"
+        self.src = open(src_file, "r").readlines()
+        self.trg = open(trg_file, "r").readlines()
+        assert len(self.src) == len(self.trg), \
+            "the number of source sequence {}" " and target sequence {} must be the same" \
+                .format(len(self.src), len(self.trg))
 
         self.max_length = max_length
         self.src_word2idx = src_word2idx
@@ -32,6 +40,9 @@ class SQuadDataset(data.Dataset):
         src_seq = self.preprocess(src_seq, self.src_word2idx)
         trg_seq = self.preprocess(trg_seq, self.trg_word2idx)
         return src_seq, trg_seq
+
+    def __len__(self):
+        return self.num_seqs
 
     def preprocess(self, sequence, word2idx):
         tokens = sequence.split()
@@ -117,3 +128,62 @@ def make_embedding(embedding_file, output_file, word2idx):
     with open(output_file, "wb") as f:
         pickle.dump(embedding, f)
     return embedding
+
+
+def time_since(t):
+    """ Function for time. """
+    return time.time() - t
+
+
+def progress_bar(completed, total, step=5):
+    """ Function returning a string progress bar. """
+    percent = int((completed / total) * 100)
+    bar = '[='
+    arrow_reached = False
+    for t in range(step, 101, step):
+        if arrow_reached:
+            bar += ' '
+        else:
+            if percent // t != 0:
+                bar += '='
+            else:
+                bar = bar[:-1]
+                bar += '>'
+                arrow_reached = True
+    if percent == 100:
+        bar = bar[:-1]
+        bar += '='
+    bar += ']'
+    return bar
+
+
+def user_friendly_time(s):
+    """ Display a user friendly time from number of second. """
+    s = int(s)
+    if s < 60:
+        return "{}s".format(s)
+
+    m = s // 60
+    s = s % 60
+    if m < 60:
+        return "{}m {}s".format(m, s)
+
+    h = m // 60
+    m = m % 60
+    if h < 24:
+        return "{}h {}m {}s".format(h, m, s)
+
+    d = h // 24
+    h = h % 24
+    return "{}d {}h {}m {}s".format(d, h, m, s)
+
+
+def eta(start, completed, total):
+    """ Function returning an ETA. """
+    # Computation
+    took = time_since(start)
+    time_per_step = took / completed
+    remaining_steps = total - completed
+    remaining_time = time_per_step * remaining_steps
+
+    return user_friendly_time(remaining_time)
