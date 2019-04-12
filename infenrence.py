@@ -1,9 +1,10 @@
 from model import Seq2seq
 import os
-from data_utils import START_ID, END_ID
+from data_utils import START_TOKEN, END_ID, get_loader, UNK_ID, outputids2words
 import torch
 import torch.nn.functional as F
 import config
+import pickle
 
 
 class Hypothesis(object):
@@ -30,14 +31,26 @@ class Hypothesis(object):
 
 
 class BeamSearcher(object):
-    def __init__(self, data_loader, test_file, tok2idx, model_path, output_dir):
-        self.test_data = open(test_file, "r").readlines()
-        self.data_loader = data_loader
-        self.tok2idx = tok2idx
-        self.idx2tok = {idx: tok for tok, idx in tok2idx.items()}
+    def __init__(self, model_path, output_dir):
+        with open(config.src_word2idx_file, "rb") as f:
+            src_word2idx = pickle.load(f)
+
+        self.output_dir = output_dir
+        self.test_data = open(config.test_trg_file, "r").readlines()
+        self.data_loader = get_loader(config.test_src_file,
+                                      config.test_trg_file,
+                                      src_word2idx,
+                                      src_word2idx,
+                                      batch_size=1,
+                                      shuffle=False)
+
+        self.tok2idx = src_word2idx
+        self.idx2tok = {idx: tok for tok, idx in self.tok2idx.items()}
         self.model = Seq2seq(model_path=model_path)
-        self.pred_dir = os.path.join(output_dir, "generated.txt")
-        self.golden_dir = os.paht.join(output_dir, "golden.txt")
+        self.pred_dir = output_dir + "/generated.txt"
+        self.golden_dir = output_dir + "/golden.txt"
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
 
     @staticmethod
     def sort_hypotheses(hypotheses):
@@ -46,13 +59,12 @@ class BeamSearcher(object):
     def decode(self):
         pred_fw = open(self.pred_dir, "w")
         golden_fw = open(self.golden_dir, "w")
-        for i, eval_data in enumerate(self.data_loader, start=1):
-            src_seq, src_len, _, _ = eval_data
-            best_question = self.beam_search(src_seq, src_len)
-            # discard START token
-            output_indice = [int(idx) for idx in best_question.tokens[1:]]
-            decoded_words = [self.idx2tok(idx) for idx in output_indice]
-
+        for i, eval_data in enumerate(self.data_loader):
+            src_seq, ext_src_seq, src_len, _, _, _, oov_lst = eval_data
+            best_question = self.beam_search(src_seq, ext_src_seq, src_len)
+            # discard START  token
+            output_indices = [int(idx) for idx in best_question.tokens[1:-1]]
+            decoded_words = outputids2words(output_indices, self.idx2tok, oov_lst[0])
             try:
                 fst_stop_idx = decoded_words.index(END_ID)
                 decoded_words = decoded_words[:fst_stop_idx]
@@ -60,33 +72,43 @@ class BeamSearcher(object):
                 decoded_words = decoded_words
             decoded_words = " ".join(decoded_words)
             golden_question = self.test_data[i]
+            print("write {}th question".format(i))
             pred_fw.write(decoded_words + "\n")
-            golden_fw.write(golden_question + "\n")
+            golden_fw.write(golden_question)
 
-    def beam_search(self, src_seq, src_len):
+        pred_fw.close()
+        golden_fw.close()
+
+    def beam_search(self, src_seq, ext_src_seq, src_len):
         zeros = torch.zeros_like(src_seq)
         enc_mask = torch.ByteTensor(src_seq == zeros)
+        src_len = torch.LongTensor(src_len)
+        prev_context = torch.zeros(1, 1, 2 * config.hidden_size)
 
         if config.use_gpu:
             src_seq = src_seq.to(config.device)
+            ext_src_seq = ext_src_seq.to(config.device)
             src_len = src_len.to(config.device)
             enc_mask = enc_mask.to(config.device)
+            prev_context = prev_context.to(config.device)
+
         # forward encoder
         enc_outputs, enc_states = self.model.encoder(src_seq, src_len)
         h, c = enc_states  # [2, b, d] but b = 1
-        hypotheses = [Hypothesis(tokens=[self.tok2idx[START_ID]],
+        hypotheses = [Hypothesis(tokens=[self.tok2idx[START_TOKEN]],
                                  log_probs=[0.0],
                                  state=(h[:, 0, :], c[:, 0, :]),
-                                 context=None)]
+                                 context=prev_context[0]) for _ in range(config.beam_size)]
         # tile enc_outputs, enc_mask for beam search
+        ext_src_seq = ext_src_seq.repeat(config.beam_size, 1)
         enc_outputs = enc_outputs.repeat(config.beam_size, 1, 1)
         enc_features = self.model.decoder.get_encoder_features(enc_outputs)
         enc_mask = enc_mask.repeat(config.beam_size, 1)
         num_steps = 0
         results = []
-        while num_steps < 0 and len(results) < config.beam_size:
+        while num_steps < config.max_decode_step and len(results) < config.beam_size:
             latest_tokens = [h.latest_token for h in hypotheses]
-
+            latest_tokens = [idx if idx < len(self.tok2idx) else UNK_ID for idx in latest_tokens]
             prev_y = torch.LongTensor(latest_tokens).view(-1)
 
             if config.use_gpu:
@@ -95,19 +117,22 @@ class BeamSearcher(object):
             # make batch of which size is beam size
             all_state_h = []
             all_state_c = []
-
+            all_context = []
             for h in hypotheses:
                 state_h, state_c = h.state  # [num_layers, d]
                 all_state_h.append(state_h)
                 all_state_c.append(state_c)
+                all_context.append(h.context)
+
             prev_h = torch.stack(all_state_h, dim=1)  # [num_layers, beam, d]
             prev_c = torch.stack(all_state_c, dim=1)  # [num_layers, beam, d]
+            prev_context = torch.stack(all_context, dim=0)
             prev_states = (prev_h, prev_c)
-
             # [beam_size, |V|]
-            logits, states = self.model.decoder.decode(prev_y, prev_states,
-                                                       enc_features, enc_mask)
-            h, c = states
+            logits, states, context_vector = self.model.decoder.decode(prev_y, ext_src_seq,
+                                                                       prev_states, prev_context,
+                                                                       enc_features, enc_mask)
+            h_state, c_state = states
             log_probs = F.log_softmax(logits, dim=1)
             top_k_log_probs, top_k_ids \
                 = torch.topk(log_probs, config.beam_size * 2, dim=-1)
@@ -116,12 +141,13 @@ class BeamSearcher(object):
             num_orig_hypotheses = 1 if num_steps == 0 else len(hypotheses)
             for i in range(num_orig_hypotheses):
                 h = hypotheses[i]
-                state_i = (h[:, i, :], c[:, i:, :])
-
+                state_i = (h_state[:, i, :], c_state[:, i, :])
+                context_i = context_vector[i]
                 for j in range(config.beam_size * 2):
                     new_h = h.extend(token=top_k_ids[i][j].item(),
                                      log_prob=top_k_log_probs[i][j].item(),
-                                     state=state_i)
+                                     state=state_i,
+                                     context=context_i)
                     all_hypotheses.append(new_h)
 
             hypotheses = []
