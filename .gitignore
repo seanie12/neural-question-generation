@@ -104,8 +104,12 @@ venv.bak/
 .mypy_cache/
 
 .idea
-/data
+/data/*.txt
+/data/*.pkl
+/data/*.zip
+/data/*.tgz
 /save
 /result
+/squad
 debug.py
 qgevalcap/
