@@ -10,7 +10,7 @@ This code is written in Python. Dependencies include
 * tqdm
 * [pytorch_scatter](https://github.com/rusty1s/pytorch_scatter)
 
-## download data and preprocess
+## Download data and Preprocess
 ```bash
 mkdir squad
 wget http://nlp.stanford.edu/data/glove.840B.300d.zip -O ./data/glove.840B.300d.zip 
@@ -20,6 +20,10 @@ wget https://rajpurkar.github.io/SQuAD-explorer/dataset/dev-v1.1.json -O ./squad
 cd data
 python process_data.py
 ```
+## Configuration
+You might need to change configuration in config.py. <br />
+If you want to train, change train = True in and set gpu device in config.py
+
 ## Evaluation from this [repository](https://github.com/xinyadu/nqg)
 |  <center>BLEU_1</center> |  <center>BLEU_2</center> |  <center>BLEU_3</center> | <center>BLEU_4</center> |
 |:--------|:--------:|--------:|--------:|
