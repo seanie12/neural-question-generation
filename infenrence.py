@@ -32,19 +32,19 @@ class Hypothesis(object):
 
 class BeamSearcher(object):
     def __init__(self, model_path, output_dir):
-        with open(config.src_word2idx_file, "rb") as f:
-            src_word2idx = pickle.load(f)
+        with open(config.word2idx_file, "rb") as f:
+            word2idx = pickle.load(f)
 
         self.output_dir = output_dir
         self.test_data = open(config.test_trg_file, "r").readlines()
         self.data_loader = get_loader(config.test_src_file,
                                       config.test_trg_file,
-                                      src_word2idx,
-                                      src_word2idx,
+                                      word2idx,
                                       batch_size=1,
+                                      use_tag=config.use_tag,
                                       shuffle=False)
 
-        self.tok2idx = src_word2idx
+        self.tok2idx = word2idx
         self.idx2tok = {idx: tok for tok, idx in self.tok2idx.items()}
         self.model = Seq2seq(model_path=model_path)
         self.pred_dir = output_dir + "/generated.txt"
@@ -60,8 +60,14 @@ class BeamSearcher(object):
         pred_fw = open(self.pred_dir, "w")
         golden_fw = open(self.golden_dir, "w")
         for i, eval_data in enumerate(self.data_loader):
-            src_seq, ext_src_seq, src_len, _, _, _, oov_lst = eval_data
-            best_question = self.beam_search(src_seq, ext_src_seq, src_len)
+            if config.use_tag:
+                src_seq, ext_src_seq, src_len, trg_seq, \
+                ext_trg_seq, trg_len, tag_seq, oov_lst = eval_data
+            else:
+                src_seq, ext_src_seq, src_len, \
+                trg_seq, ext_trg_seq, trg_len, oov_lst = eval_data
+                tag_seq = None
+            best_question = self.beam_search(src_seq, ext_src_seq, src_len, tag_seq)
             # discard START  token
             output_indices = [int(idx) for idx in best_question.tokens[1:-1]]
             decoded_words = outputids2words(output_indices, self.idx2tok, oov_lst[0])
@@ -79,7 +85,7 @@ class BeamSearcher(object):
         pred_fw.close()
         golden_fw.close()
 
-    def beam_search(self, src_seq, ext_src_seq, src_len):
+    def beam_search(self, src_seq, ext_src_seq, src_len, tag_seq):
         zeros = torch.zeros_like(src_seq)
         enc_mask = torch.ByteTensor(src_seq == zeros)
         src_len = torch.LongTensor(src_len)
@@ -92,8 +98,10 @@ class BeamSearcher(object):
             enc_mask = enc_mask.to(config.device)
             prev_context = prev_context.to(config.device)
 
+            if config.use_tag:
+                tag_seq = tag_seq.to(config.device)
         # forward encoder
-        enc_outputs, enc_states = self.model.encoder(src_seq, src_len)
+        enc_outputs, enc_states = self.model.encoder(src_seq, src_len, tag_seq)
         h, c = enc_states  # [2, b, d] but b = 1
         hypotheses = [Hypothesis(tokens=[self.tok2idx[START_TOKEN]],
                                  log_probs=[0.0],

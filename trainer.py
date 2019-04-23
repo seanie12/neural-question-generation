@@ -15,25 +15,25 @@ from model import Seq2seq
 class Trainer(object):
     def __init__(self, model_path=None):
         # load dictionary and embedding file
-        with open(config.src_embedding, "rb") as f:
-            src_embedding = pickle.load(f)
-            src_embedding = torch.Tensor(src_embedding).to(config.device)
-        with open(config.src_word2idx_file, "rb") as f:
-            src_word2idx = pickle.load(f)
+        with open(config.embedding, "rb") as f:
+            embedding = pickle.load(f)
+            embedding = torch.Tensor(embedding).to(config.device)
+        with open(config.word2idx_file, "rb") as f:
+            word2idx = pickle.load(f)
 
         # train, dev loader
         print("load train data")
         self.train_loader = get_loader(config.train_src_file,
                                        config.train_trg_file,
-                                       src_word2idx,
-                                       src_word2idx,
+                                       word2idx,
+                                       use_tag=config.use_tag,
                                        batch_size=config.batch_size,
                                        debug=config.debug)
         self.dev_loader = get_loader(config.dev_src_file,
                                      config.dev_trg_file,
-                                     src_word2idx,
-                                     src_word2idx,
-                                     batch_size=512,
+                                     word2idx,
+                                     use_tag=config.use_tag,
+                                     batch_size=128,
                                      debug=config.debug)
 
         train_dir = os.path.join("./save", "seq2seq")
@@ -41,12 +41,12 @@ class Trainer(object):
         if not os.path.exists(self.model_dir):
             os.makedirs(self.model_dir)
 
-        self.model = Seq2seq(src_embedding, src_embedding, model_path=model_path)
+        self.model = Seq2seq(embedding, model_path=model_path)
         params = list(self.model.encoder.parameters()) \
                  + list(self.model.decoder.parameters())
 
         self.lr = config.lr
-        self.optim = optim.SGD(params, self.lr)
+        self.optim = optim.SGD(params, self.lr, momentum=0.8)
         # self.optim = optim.Adam(params)
         self.criterion = nn.CrossEntropyLoss(ignore_index=0)
 
@@ -68,7 +68,7 @@ class Trainer(object):
         for epoch in range(1, config.num_epochs + 1):
             print("epoch {}/{} :".format(epoch, config.num_epochs), end="\r")
             start = time.time()
-            # halving the learning rate at epoch 8
+            # halving the learning rate after epoch 8
             if epoch >= 8 and epoch % 2 == 0:
                 self.lr *= 0.5
                 state_dict = self.optim.state_dict()
@@ -100,8 +100,11 @@ class Trainer(object):
                   .format(epoch, user_friendly_time(time_since(start)), batch_loss, val_loss))
 
     def step(self, train_data):
-        src_seq, ext_src_seq, src_len, trg_seq, ext_trg_seq, trg_len, _ = train_data
-
+        if config.use_tag:
+            src_seq, ext_src_seq, src_len, trg_seq, ext_trg_seq, trg_len, tag_seq, _ = train_data
+        else:
+            src_seq, ext_src_seq, src_len, trg_seq, ext_trg_seq, trg_len, _ = train_data
+            tag_seq = None
         src_len = torch.LongTensor(src_len)
         enc_zeros = torch.zeros_like(src_seq)
         enc_mask = torch.ByteTensor(src_seq == enc_zeros)
@@ -113,8 +116,12 @@ class Trainer(object):
             trg_seq = trg_seq.to(config.device)
             ext_trg_seq = ext_trg_seq.to(config.device)
             enc_mask = enc_mask.to(config.device)
+            if config.use_tag:
+                tag_seq = tag_seq.to(config.device)
+            else:
+                tag_seq = None
 
-        enc_outputs, enc_states = self.model.encoder(src_seq, src_len)
+        enc_outputs, enc_states = self.model.encoder(src_seq, src_len, tag_seq)
         sos_trg = trg_seq[:, :-1]
         eos_trg = trg_seq[:, 1:]
 

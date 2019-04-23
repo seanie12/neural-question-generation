@@ -3,7 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
+from torch_scatter import scatter_max
 from data_utils import UNK_ID
+
+INF = 1e12
 
 
 class Encoder(nn.Module):
@@ -11,6 +14,12 @@ class Encoder(nn.Module):
         super(Encoder, self).__init__()
 
         self.embedding = nn.Embedding(vocab_size, embedding_size)
+        if config.use_tag:
+            self.tag_embedding = nn.Embedding(3, 3)
+            lstm_input_size = embedding_size + 3
+        else:
+            lstm_input_size = embedding_size
+
         if embeddings is not None:
             self.embedding = nn.Embedding(vocab_size, embedding_size). \
                 from_pretrained(embeddings, freeze=config.freeze_embedding)
@@ -18,7 +27,7 @@ class Encoder(nn.Module):
         self.num_layers = num_layers
         if self.num_layers == 1:
             dropout = 0.0
-        self.lstm = nn.LSTM(embedding_size, hidden_size, dropout=dropout,
+        self.lstm = nn.LSTM(lstm_input_size, hidden_size, dropout=dropout,
                             num_layers=num_layers, bidirectional=True, batch_first=True)
         self.linear_trans = nn.Linear(2 * hidden_size, 2 * hidden_size)
         self.update_layer = nn.Linear(4 * hidden_size, 2 * hidden_size, bias=False)
@@ -39,9 +48,11 @@ class Encoder(nn.Module):
 
         return updated_output
 
-    def forward(self, src_seq, src_len):
+    def forward(self, src_seq, src_len, tag_seq):
         embedded = self.embedding(src_seq)
-
+        if config.use_tag and tag_seq is not None:
+            tag_embedded = self.tag_embedding(tag_seq)
+            embedded = torch.cat((embedded, tag_embedded), dim=2)
         packed = pack_padded_sequence(embedded, src_len, batch_first=True)
         outputs, states = self.lstm(packed)  # states : tuple of [4, b, d]
         outputs, _ = pad_packed_sequence(outputs, batch_first=True)  # [b, t, d]
@@ -52,18 +63,13 @@ class Encoder(nn.Module):
         memories = self.linear_trans(outputs)
         outputs = self.gated_self_attn(outputs, memories, mask)
 
-        if self.num_layers == 2:
-            _, b, d = h.size()
-            h = h.view(2, 2, b, d)  # [n_layers, bi, b, d]
-            h = torch.cat((h[:, 0, :, :], h[:, 1, :, :]), dim=-1)
+        _, b, d = h.size()
+        h = h.view(2, 2, b, d)  # [n_layers, bi, b, d]
+        h = torch.cat((h[:, 0, :, :], h[:, 1, :, :]), dim=-1)
 
-            c = c.view(2, 2, b, d)
-            c = torch.cat((c[:, 0, :, :], c[:, 1, :, :]), dim=-1)
-            concat_states = (h, c)
-        else:
-            h = torch.cat([h[0], h[1]], dim=1).unsqueeze(0)  # [1, b, 2d]
-            c = torch.cat([c[0], c[1]], dim=1).unsqueeze(0)  # [1, b, 2d]
-            concat_states = (h, c)
+        c = c.view(2, 2, b, d)
+        c = torch.cat((c[:, 0, :, :], c[:, 1, :, :]), dim=-1)
+        concat_states = (h, c)
 
         return outputs, concat_states
 
@@ -104,7 +110,7 @@ class Decoder(nn.Module):
         # init_states : [2,b,d]
         # encoder_outputs : [b,t,d]
         # init_states : a tuple of [2, b, d]
-        num_oov = torch.max(ext_src_seq - self.vocab_size + 1)
+
         batch_size, max_len = trg_seq.size()
         hidden_size = encoder_outputs.size(-1)
         memories = self.get_encoder_features(encoder_outputs)
@@ -122,12 +128,16 @@ class Decoder(nn.Module):
             logit_input = torch.tanh(self.concat_layer(concat_input))
             logit = self.logit_layer(logit_input)  # [b, |V|]
 
-            # pointer network
+            # maxout pointer network
             if config.use_pointer:
+                num_oov = max(torch.max(ext_src_seq - self.vocab_size + 1), 0)
                 zeros = torch.zeros((batch_size, num_oov), device=config.device)
                 extended_logit = torch.cat([logit, zeros], dim=1)
-                logit = extended_logit.scatter_add(1, ext_src_seq, energy)
-                logit = logit.masked_fill(logit == 0, value=-1e12)
+                out = torch.zeros_like(extended_logit) - INF
+                out, _ = scatter_max(energy, ext_src_seq, out=out)
+                out = out.masked_fill(out == -INF, 0)
+                logit = extended_logit + out
+                logit = logit.masked_fill(logit == 0, -INF)
 
             logits.append(logit)
             # update prev state and context
@@ -155,22 +165,25 @@ class Decoder(nn.Module):
             num_oov = max(torch.max(ext_x - self.vocab_size + 1), 0)
             zeros = torch.zeros((batch_size, num_oov), device=config.device)
             extended_logit = torch.cat([logit, zeros], dim=1)
-            logit = extended_logit.scatter_add(1, ext_x, energy)
-            logit = logit.masked_fill(logit == 0, value=-1e12)
+            out = torch.zeros_like(extended_logit) - INF
+            out, _ = scatter_max(energy, ext_x, out=out)
+            out = out.masked_fill(out == -INF, 0)
+            logit = extended_logit + out
+            logit = logit.masked_fill(logit == -INF, 0)
             # forcing UNK prob 0
-            logit[:, UNK_ID] = -1e12
+            logit[:, UNK_ID] = -INF
 
         return logit, states, context
 
 
 class Seq2seq(nn.Module):
-    def __init__(self, enc_embedding=None, dec_embedding=None, is_eval=False, model_path=None):
+    def __init__(self, embedding=None, is_eval=False, model_path=None):
         super(Seq2seq, self).__init__()
-        encoder = Encoder(enc_embedding, config.enc_vocab_size,
+        encoder = Encoder(embedding, config.vocab_size,
                           config.embedding_size, config.hidden_size,
                           config.num_layers,
                           config.dropout)
-        decoder = Decoder(dec_embedding, config.dec_vocab_size,
+        decoder = Decoder(embedding, config.vocab_size,
                           config.embedding_size, 2 * config.hidden_size,
                           config.num_layers,
                           config.dropout)
