@@ -249,14 +249,14 @@ def collate_fn_tag(data):
 def get_loader(src_file, trg_file, word2idx,
                batch_size, use_tag=False, debug=False, shuffle=False):
     if use_tag:
-        dataset = SQuadDatasetWithTag(src_file, trg_file, config.max_len,
+        dataset = SQuadDatasetWithTag(src_file, trg_file, config.max_seq_len,
                                       word2idx, debug)
         dataloader = data.DataLoader(dataset=dataset,
                                      batch_size=batch_size,
                                      shuffle=shuffle,
                                      collate_fn=collate_fn_tag)
     else:
-        dataset = SQuadDataset(src_file, trg_file, config.max_len,
+        dataset = SQuadDataset(src_file, trg_file, config.max_seq_len,
                                word2idx, debug)
         dataloader = data.DataLoader(dataset=dataset,
                                      batch_size=batch_size,
@@ -565,3 +565,26 @@ def make_conll_format(examples, src_file, trg_file):
 
     src_fw.close()
     trg_fw.close()
+
+
+def split_dev(input_file, dev_file, test_file):
+    with open(input_file) as f:
+        input_file = json.load(f)
+
+    input_data = input_file["data"]
+
+    # split the original SQuAD dev set into new dev / test set
+    num_total = len(input_data)
+    num_dev = int(num_total * 0.5)
+
+    dev_data = input_data[:num_dev]
+    test_data = input_data[num_dev:]
+
+    dev_dict = {"data": dev_data}
+    test_dict = {"data": test_data}
+
+    with open(dev_file, "w") as f:
+        json.dump(dev_dict, f)
+
+    with open(test_file, "w") as f:
+        json.dump(test_dict, f)
