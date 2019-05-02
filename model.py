@@ -5,32 +5,31 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 from torch_scatter import scatter_max
 from data_utils import UNK_ID
-from pytorch_pretrained_bert import BertForQuestionAnswering
+from pytorch_pretrained_bert import BertForQuestionAnswering, BertModel
 
 INF = 1e12
 
 
 class Encoder(nn.Module):
-    def __init__(self, embeddings, hidden_size, num_layers, dropout, use_tag):
+    def __init__(self, embeddings, vocab_size, embedding_size,
+                 hidden_size, num_layers, dropout, use_tag):
         super(Encoder, self).__init__()
-        vocab_size, embedding_size = embeddings.size()
-
         self.use_tag = use_tag
-        self.embedding = nn.Embedding(vocab_size, embedding_size)
+
+        # tag embedding
         if use_tag:
             self.tag_embedding = nn.Embedding(3, 3)
             lstm_input_size = embedding_size + 3
         else:
             lstm_input_size = embedding_size
 
-        self.embedding = nn.Embedding(vocab_size, embedding_size)
-
         if embeddings is not None:
-            if "FloatTensor" in embeddings.type():
+            if "Tensor" in str(type(embeddings)):
+                self.embedding = nn.Embedding(vocab_size, embedding_size)
                 self.embedding.from_pretrained(embeddings, freeze=True)
-            else:
-                self.embedding.weight = embeddings
-                self.embedding.requires_grad = False
+        else:
+            self.embedding = BertModel.from_pretrained("bert-base-uncased").embeddings
+            self.embedding.requires_grad = False
 
         self.num_layers = num_layers
         if self.num_layers == 1:
@@ -58,6 +57,7 @@ class Encoder(nn.Module):
 
     def forward(self, src_seq, src_len, tag_seq):
         total_length = src_seq.size(1)
+
         embedded = self.embedding(src_seq)
         if self.use_tag and tag_seq is not None:
             tag_embedded = self.tag_embedding(tag_seq)
@@ -87,20 +87,16 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, embeddings, hidden_size, num_layers, dropout):
+    def __init__(self, embedding, vocab_size, embedding_size,
+                 hidden_size, num_layers, dropout):
         super(Decoder, self).__init__()
-        vocab_size, embedding_size = embeddings.size()
         self.vocab_size = vocab_size
-
-        self.embedding = nn.Embedding(vocab_size, embedding_size)
-        if embeddings is not None:
+        if embedding is not None:
             self.embedding = nn.Embedding(vocab_size, embedding_size)
-
-            if "FloatTensor" in embeddings.type():
-                self.embedding.from_pretrained(embeddings, freeze=True)
-            else:
-                self.embedding.weight = embeddings
-                self.embedding.requires_grad = False
+            self.embedding.from_pretrained(embedding, freeze=True)
+        else:
+            self.embedding = BertModel.from_pretrained("bert-base-uncased").embeddings
+            self.embedding.requires_grad = False
 
         if num_layers == 1:
             dropout = 0.0
@@ -135,10 +131,10 @@ class Decoder(nn.Module):
         memories = self.get_encoder_features(encoder_outputs)
         logits = []
         prev_states = init_states
+        self.lstm.flatten_parameters()
         for i in range(max_len):
-            y_i = trg_seq[:, i].unsqueeze(1)  # [b, 1]
-            embedded = self.embedding(y_i)  # [b, 1, d]
-            self.lstm.flatten_parameters()
+            y_i = trg_seq[:, i].unsqueeze(dim=1)
+            embedded = self.embedding(y_i)
             output, states = self.lstm(embedded, prev_states)
             # encoder-decoder attention
             context, energy = self.attention(output, memories, encoder_mask)
@@ -240,6 +236,8 @@ class AnswerSelector(nn.Module):
     def __init__(self, embedding=None, model_path=None):
         super(AnswerSelector, self).__init__()
         self.encoder = Encoder(embedding,
+                               config.vocab_size,
+                               config.embedding_size,
                                config.hidden_size,
                                config.num_layers,
                                config.dropout,
@@ -264,11 +262,16 @@ class Seq2seq(nn.Module):
     def __init__(self, embedding=None, use_tag=False, model_path=None):
         super(Seq2seq, self).__init__()
         encoder = Encoder(embedding,
+                          config.vocab_size,
+                          config.embedding_size,
                           config.hidden_size,
                           config.num_layers,
                           config.dropout,
                           use_tag)
+
         decoder = Decoder(embedding,
+                          config.vocab_size,
+                          config.embedding_size,
                           2 * config.hidden_size,
                           config.num_layers,
                           config.dropout)
@@ -296,50 +299,72 @@ class Seq2seq(nn.Module):
 
 
 class DualNet(nn.Module):
-    def __init__(self, c2q_model_path, c2a_model_path):
+    def __init__(self, ca2q_model_path, c2q_model_path, c2a_model_path):
         super(DualNet, self).__init__()
 
         self.qa_model = BertForQuestionAnswering.from_pretrained("bert-base-uncased")
-        embedding = self.qa_model.bert.embeddings.word_embeddings.weight
 
-        self.ca2q_model = Seq2seq(embedding, use_tag=True)
-        self.c_encoder = Encoder(embedding, config.hidden_size,
-                                 config.num_layers, config.dropout,
-                                 use_tag=False)
-        self.c2q_decoder = Decoder(embedding, 2 * config.hidden_size,
-                                   config.num_layers, config.dropout)
-        self.c2a_decoder = PointerDecoder(2 * config.hidden_size,
-                                          config.num_layers,
-                                          config.dropout)
+        self.ca2q_model = Seq2seq(None, use_tag=True,
+                                  model_path=ca2q_model_path)
+        self.c2q_model = Seq2seq(None, use_tag=False,
+                                 model_path=c2q_model_path)
+        self.c2a_model = AnswerSelector(None, c2a_model_path)
+
+        # eval mode
+        self.c2q_model.encoder.eval()
+        self.c2q_model.decoder.eval()
+        self.c2a_model.encoder.eval()
+        self.c2a_model.decoder.eval()
+
+        # freeze pre-trained c2q and c2a models
+        self.c2q_model.requires_grad = False
+        self.c2a_model.requires_grad = False
 
     def forward(self, batch_data):
+        device = torch.device("cuda")
         # sorting for using packed_sequence and padded_pack_sequence
         c_ids, c_lens, tag_ids, q_ids, \
         input_ids, input_mask, segment_ids, \
         start_positions, end_positions, \
         noq_start_positions, noq_end_positions = batch_data
 
+        # remove unnecessary pad token
+        max_c_len = torch.max(c_lens)
+        c_ids = c_ids[:, :max_c_len]
+        tag_ids = tag_ids[:, :max_c_len]
+
+        q_lens = torch.sum(torch.sign(q_ids),1 )
+        max_q_len = torch.max(q_lens)
+        q_ids = q_ids[:, :max_q_len]
+
+        input_lens = torch.sum(torch.sign(input_ids), 1)
+        max_input_lens = torch.max(input_lens)
+        input_ids = input_ids[:, :max_input_lens]
+        input_mask = input_mask[:, :max_input_lens]
+        segment_ids = segment_ids[:, :max_input_lens]
+
         # sorting for using packed_padded_sequence and pad_packed_sequence
         c_lens, idx = torch.sort(c_lens, descending=True)
-        c_ids = c_ids[idx]
-        tag_ids = tag_ids[idx]
-        q_ids = q_ids[idx]
-        input_ids = input_ids[idx]
-        input_mask = input_mask[idx]
-        segment_ids = segment_ids[idx]
-        start_positions = start_positions[idx]
-        end_positions = end_positions[idx]
-        noq_start_positions = noq_start_positions[idx]
-        noq_end_positions = noq_end_positions[idx]
+        c_lens = c_lens.to(device)
+        c_ids = c_ids[idx].to(device)
+        tag_ids = tag_ids[idx].to(device)
+        q_ids = q_ids[idx].to(device)
+        input_ids = input_ids[idx].to(device)
+        input_mask = input_mask[idx].to(device)
+        segment_ids = segment_ids[idx].to(device)
+        start_positions = start_positions[idx].to(device)
+        end_positions = end_positions[idx].to(device)
+        noq_start_positions = noq_start_positions[idx].to(device)
+        noq_end_positions = noq_end_positions[idx].to(device)
 
         # QA loss
         qa_loss = self.qa_model(input_ids, segment_ids, input_mask, start_positions, end_positions)
 
         # QG without answer loss
-        enc_outputs, enc_states = self.c_encoder(c_ids, c_lens, None)
+        enc_outputs, enc_states = self.c2q_model.encoder(c_ids, c_lens, None)
         sos_q_ids = q_ids[:, :-1]
         eos_q_ids = q_ids[:, 1:]
-        q_logits = self.c2q_decoder(sos_q_ids, c_ids, enc_states, enc_outputs)
+        q_logits = self.c2q_model.decoder(sos_q_ids, c_ids, enc_states, enc_outputs)
         batch_size, nsteps, _ = q_logits.size()
         criterion = nn.CrossEntropyLoss(ignore_index=0)
         preds = q_logits.view(batch_size * nsteps, -1)
@@ -353,8 +378,7 @@ class DualNet(nn.Module):
         ca2q_loss = criterion(preds, targets)
 
         # answer span without question
-        enc_outputs, states = self.c_encoder(c_ids, c_lens, None)
-        logits = self.c2a_decoder(enc_outputs, states, start_positions)
+        logits = self.c2a_decoder(c_ids, c_lens, start_positions)
         start_logits, end_logits = logits
 
         ignored_index = start_logits.size(1)
@@ -370,7 +394,5 @@ class DualNet(nn.Module):
         reg_loss = (qa_loss + c2q_loss - ca2q_loss - c2a_loss) ** 2
 
         qa_loss = (qa_loss + config.dual_lambda * reg_loss)
-        c2q_loss = (c2q_loss + config.dual_lambda * reg_loss)
         ca2q_loss = (ca2q_loss + config.dual_lambda * reg_loss)
-        c2a_loss = (c2a_loss + config.dual_lambda * reg_loss)
-        return qa_loss, c2q_loss, ca2q_loss, c2a_loss
+        return qa_loss, ca2q_loss

@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, RandomSampler, DataLoader
-from pytorch_pretrained_bert import BertTokenizer, BertAdam, BertForQuestionAnswering
+from pytorch_pretrained_bert import BertTokenizer, BertAdam, BertForQuestionAnswering, BertModel
 
 import config
 from data_utils import get_loader, eta, user_friendly_time, progress_bar, time_since
@@ -153,9 +153,8 @@ class QGTrainer(object):
     def __init__(self):
         # load Bert Tokenizer and pre-trained word embedding
         self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-        embedding = BertForQuestionAnswering.from_pretrained("bert-base-uncased") \
-            .bert.embeddings.word_embeddings.weight
-        self.model = Seq2seq(embedding, use_tag=False)
+        embeddings = None
+        self.model = Seq2seq(embeddings, use_tag=config.use_tag)
 
         train_dir = os.path.join("./save", "c2q")
 
@@ -169,8 +168,8 @@ class QGTrainer(object):
         params = list(self.model.encoder.parameters()) \
                  + list(self.model.decoder.parameters())
 
-        self.lr = 1.0
-        self.optim = optim.Adam(params)
+        self.lr = 0.1
+        self.optim = optim.SGD(params, lr=self.lr)
         self.criterion = nn.CrossEntropyLoss(ignore_index=0)
 
     def get_data_loader(self, file):
@@ -183,9 +182,10 @@ class QGTrainer(object):
                                                       is_training=True)
 
         all_c_ids = torch.tensor([f.c_ids for f in train_features], dtype=torch.long)
-        all_c_lens = torch.sign(torch.sum(all_c_ids, 1)).long()
+        all_c_lens = torch.sum(torch.sign(all_c_ids), 1).long()
         all_q_ids = torch.tensor([f.q_ids for f in train_features], dtype=torch.long)
         all_tag_ids = torch.tensor([f.tag_ids for f in train_features], dtype=torch.long)
+
         train_data = TensorDataset(all_c_ids, all_c_lens, all_tag_ids, all_q_ids)
         sampler = RandomSampler(train_data)
         train_loader = DataLoader(train_data, sampler=sampler, batch_size=config.batch_size)
@@ -210,6 +210,13 @@ class QGTrainer(object):
         for epoch in range(1, config.num_epochs + 1):
             print("epoch {}/{} :".format(epoch, config.num_epochs), end="\r")
             start = time.time()
+
+            if epoch >= 8 and epoch % 2 == 0:
+                self.lr *= 0.5
+                state_dict = self.optim.state_dict()
+                for param_group in state_dict["param_groups"]:
+                    param_group["lr"] = self.lr
+                self.optim.load_state_dict(state_dict)
 
             for batch_idx, train_data in enumerate(self.train_loader, start=1):
                 batch_loss = self.step(train_data)
@@ -236,15 +243,17 @@ class QGTrainer(object):
 
     def step(self, train_data):
         c_ids, c_lens, tag_ids, q_ids = train_data
+
         # exclude unnecessary PAD tokens of c_ids and q_ids
         max_c_len = torch.max(c_lens)
         c_ids = c_ids[:, :max_c_len]
-        q_len = torch.sum(torch.sign(q_ids), 1).long()
+        tag_ids = tag_ids[:, :max_c_len]
+        q_len = torch.sum(torch.sign(q_ids), 1)
         max_q_len = torch.max(q_len)
         q_ids = q_ids[:, :max_q_len]
 
         # sort data by the length of input seq and allocate tensors to gpu device
-        c_lens, idx = torch.sort(c_lens)
+        c_lens, idx = torch.sort(c_lens, descending=True)
         c_ids = c_ids[idx].to(config.device)
         c_lens = c_lens.to(config.device)
         q_ids = q_ids[idx].to(config.device)
@@ -287,11 +296,8 @@ class QGTrainer(object):
 class C2ATrainer(object):
     def __init__(self):
         self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-        embedding = BertForQuestionAnswering.from_pretrained("bert-base-uncased") \
-            .bert.embeddings.word_embeddings.weight
-
         # instantiate class and allocate it to gpu device
-        self.model = AnswerSelector(embedding).to(config.device)
+        self.model = AnswerSelector().to(config.device)
         train_dir = os.path.join("./save", "c2a")
         self.train_loader = self.get_data_loader("./squad/train-v1.1.json")
         self.dev_loader = self.get_data_loader("./squad/new_dev-v1.1.json")
@@ -332,6 +338,8 @@ class C2ATrainer(object):
         batch_num = len(self.train_loader)
         best_loss = 1e10
         for epoch in range(1, config.num_epochs + 1):
+            self.model.encoder.train()
+            self.model.decoder.train()
             print("epoch {}/{} :".format(epoch, config.num_epochs), end="\r")
             start = time.time()
 
@@ -391,8 +399,6 @@ class C2ATrainer(object):
                 val_losses.append(val_batch_loss.item())
                 msg2 = "{} => Evaluating :{}/{}".format(msg, i, num_val_batches)
                 print(msg2, end="\r")
-        # go back to train mode
-        self.model.train()
         val_loss = np.mean(val_losses)
 
         return val_loss
@@ -425,18 +431,15 @@ class DualTrainer(object):
                                warmup=config.warmup_proportion,
                                t_total=num_train_optimization_steps)
 
-        params = list(self.model.c_encoder.parameters()) \
-                 + list(self.model.ca2q_model.parameters()) \
-                 + list(self.model.c2a_decoder.parameters()) \
-                 + list(self.model.c2q_decoder.parameters())
-        self.general_opt = optim.Adam(params, lr=config.lr)
+        params = list(self.model.ca2q_model.encoder.parameters()) \
+                 + list(self.model.ca2q_model.decoder.parameters())
+        self.qg_lr = config.lr
+        self.qg_opt = optim.SGD(params, lr=self.qg_lr)
 
-        # assign model to device and wrap it with Dataparallel
+        # assign model to device and wrap it with DataParallel
         torch.cuda.set_device(0)
         self.model.cuda()
         self.model = nn.DataParallel(self.model)
-
-        self.model.train()
 
     def get_data_loader(self, file):
         train_examples = read_squad_examples(file, is_training=True, debug=config.debug)
@@ -479,46 +482,67 @@ class DualTrainer(object):
 
         state_dict = model_to_save.state_dict()
         torch.save(state_dict, model_file)
-        json_file = model_to_save.config.to_json_string(config_file)
+        json_file = model_to_save.config.to_json_file(config_file)
         with open(config_file, "w") as f:
             f.write(json_file)
 
     def train(self):
         global_step = 1
-        device = torch.device("cuda")
         batch_num = len(self.train_loader)
+        self.model.module.qa_model.train()
+        self.model.module.ca2q_model.train()
+        best_loss = 1e10
         for epoch in range(1, config.num_epochs + 1):
             start = time.time()
             for batch_idx, batch in enumerate(self.train_loader, start=1):
-                batch = tuple(t.to(device) for t in batch)
-                qa_loss, c2q_loss, ca2q_loss, c2a_loss = self.model(batch)
+                qa_loss, ca2q_loss = self.model(batch)
                 # zero grad
                 self.qa_opt.zero_grad()
-                self.general_opt.zero_grad()
+                self.qg_opt.zero_grad()
                 # mean() to average across multiple gpu and back-propagation
                 qa_loss = qa_loss.mean()
-                c2q_loss = c2q_loss.mean()
                 ca2q_loss = ca2q_loss.mean()
-                c2a_loss = c2a_loss.mean()
 
                 qa_loss.backward(retain_graph=True)
-                c2q_loss.backward(retain_graph=True)
-                ca2q_loss.backward(retain_graph=True)
-                c2a_loss.backward()
+                ca2q_loss.backward()
 
                 # clip gradient
                 nn.utils.clip_grad_norm_(self.model.module.c_encoder.parameters(), config.max_grad_norm)
-                nn.utils.clip_grad_norm_(self.model.module.c2q_decoder.parameters(), config.max_grad_norm)
-                nn.utils.clip_grad_norm_(self.model.module.c2a_decoder.parameters(), config.max_grad_norm)
                 nn.utils.clip_grad_norm_(self.model.module.ca2q_model.parameters(), config.max_grad_norm)
 
                 # update params
                 self.qa_opt.step()
-                self.general_opt.step()
+                self.qg_opt.step()
                 global_step += 1
-                msg = "{}/{} {} - ETA : {} - qa_loss: {:.2f}, c2q_loss :{:.2f}, ca2q_loss :{:.2f}, c2a_loss:{:.2f}" \
+                msg = "{}/{} {} - ETA : {} - qa_loss: {:.2f}, ca2q_loss :{:.2f}" \
                     .format(batch_idx, batch_num, progress_bar(batch_idx, batch_num),
                             eta(start, batch_idx, batch_num),
-                            qa_loss.item(), c2q_loss.item(), ca2q_loss.item(), c2a_loss.item())
+                            qa_loss.item(), ca2q_loss.item())
                 print(msg, end="\r")
-            print("----------------------------")
+
+            val_qa_loss, val_qg_loss = self.evaluate(msg)
+            if val_qg_loss <= best_loss:
+                best_loss = val_qg_loss
+                self.save_model(val_qg_loss, epoch)
+
+            print("Epoch {} took {} - final loss : {:.4f} -  qa_loss :{:.4f}, qg_loss :{:.4f}"
+                  .format(epoch, user_friendly_time(time_since(start)), batch_loss, val_qg_loss))
+
+    def evaluate(self, msg):
+        self.model.module.qa_model.eval()
+        self.model.module.ca2_model.eval_mode()
+        num_val_batches = len(self.dev_loader)
+        val_qa_losses = []
+        val_qg_losses = []
+        for i, val_data in enumerate(self.dev_loader, start=1):
+            with torch.no_grad():
+                val_batch_loss = self.model(val_data)
+                qa_loss, qg_loss = val_batch_loss
+                val_qa_losses.append(qa_loss.item())
+                val_qg_losses.append(qg_loss.item())
+                msg2 = "{} => Evaluating :{}/{}".format(msg, i, num_val_batches)
+                print(msg2, end="\r")
+        val_qa_loss = np.mean(val_qa_losses)
+        val_qg_loss = np.mean(val_qg_losses)
+
+        return val_qa_loss, val_qg_loss

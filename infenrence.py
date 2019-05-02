@@ -2,8 +2,9 @@ from model import Seq2seq
 import os
 from data_utils import START_TOKEN, END_ID, get_loader, UNK_ID, outputids2words
 from squad_utils import read_squad_examples, convert_examples_to_features
+from pytorch_pretrained_bert import BertTokenizer
 import torch
-from torch.utils.data import SequentialSampler, DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
 import torch.nn.functional as F
 import config
 import pickle
@@ -34,21 +35,17 @@ class Hypothesis(object):
 
 class BeamSearcher(object):
     def __init__(self, model_path, output_dir):
-        with open(config.word2idx_file, "rb") as f:
-            word2idx = pickle.load(f)
-
+        self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         self.output_dir = output_dir
-        self.test_data = open(config.test_trg_file, "r").readlines()
-        self.data_loader = get_loader(config.test_src_file,
-                                      config.test_trg_file,
-                                      word2idx,
-                                      batch_size=1,
-                                      use_tag=config.use_tag,
-                                      shuffle=False)
+        # self.test_data = open(config.test_trg_file, "r").readlines()
+        self.golden_q_ids = None
+        self.data_loader = self.get_data_loader("./squad/new_test-v1.1.json")
 
-        self.tok2idx = word2idx
+        self.tok2idx = self.tokenizer.vocab
         self.idx2tok = {idx: tok for tok, idx in self.tok2idx.items()}
-        self.model = Seq2seq(model_path=model_path)
+        self.model = Seq2seq(model_path=model_path, use_tag=True)
+        self.model.requires_grad = False
+        self.model.eval_mode()
         self.pred_dir = output_dir + "/generated.txt"
         self.golden_dir = output_dir + "/golden.txt"
         if not os.path.exists(output_dir):
@@ -64,12 +61,12 @@ class BeamSearcher(object):
                                                       is_training=True)
 
         all_c_ids = torch.tensor([f.c_ids for f in train_features], dtype=torch.long)
-        all_c_lens = torch.sign(torch.sum(all_c_ids, 1)).long()
+        all_c_lens = torch.sum(torch.sign(all_c_ids), 1)
         all_q_ids = torch.tensor([f.q_ids for f in train_features], dtype=torch.long)
-
-        train_data = TensorDataset(all_c_ids, all_c_lens, all_q_ids)
-        sampler = SequentialSampler(train_data)
-        train_loader = DataLoader(train_data, sampler=sampler, batch_size=1)
+        all_tag_ids = torch.tensor([f.tag_ids for f in train_features], dtype=torch.long)
+        train_data = TensorDataset(all_c_ids, all_c_lens, all_tag_ids, all_q_ids)
+        train_loader = DataLoader(train_data, shuffle=False, batch_size=1)
+        self.golden_q_ids = all_q_ids
 
         return train_loader
 
@@ -81,27 +78,36 @@ class BeamSearcher(object):
         pred_fw = open(self.pred_dir, "w")
         golden_fw = open(self.golden_dir, "w")
         for i, eval_data in enumerate(self.data_loader):
-            c_ids, c_lens, q_ids = eval_data
-            tag_seq = None
-            best_question = self.beam_search(c_ids, c_lens, q_ids, tag_seq)
+            c_ids, c_lens, tag_seq, q_ids = eval_data
+            c_ids = c_ids.to(config.device)
+            c_lens = c_lens.to(config.device)
+            tag_seq = tag_seq.to(config.device)
+            if config.use_tag is False:
+                tag_seq = None
+            best_question = self.beam_search(c_ids, c_lens, tag_seq)
             # discard START  token
-            output_indices = [int(idx) for idx in best_question.tokens[1:-1]]
-            decoded_words = outputids2words(output_indices, self.idx2tok, oov_lst[0])
+            output_indices = [int(idx) for idx in best_question.tokens[1:]]
+            # decoded_words = outputids2words(output_indices, self.idx2tok, oov_lst[0])
+            decoded_words = self.tokenizer.convert_ids_to_tokens(output_indices)
             try:
-                fst_stop_idx = decoded_words.index(END_ID)
+                fst_stop_idx = decoded_words.index("[SEP]")
                 decoded_words = decoded_words[:fst_stop_idx]
             except ValueError:
                 decoded_words = decoded_words
             decoded_words = " ".join(decoded_words)
-            golden_question = self.test_data[i]
+            q_id = self.golden_q_ids[i]
+            q_len = torch.sum(torch.sign(q_ids), 1).item()
+            # discard [CLS], [SEP] and unnecessary PAD  tokens
+            q_id = q_id[1:q_len - 1].cpu().numpy()
+            golden_question = self.tokenizer.convert_ids_to_tokens(q_id)
             print("write {}th question".format(i))
             pred_fw.write(decoded_words + "\n")
-            golden_fw.write(golden_question)
+            golden_fw.write(" ".join(golden_question) + "\n")
 
         pred_fw.close()
         golden_fw.close()
 
-    def beam_search(self, src_seq, src_len, trg_seq, tag_seq):
+    def beam_search(self, src_seq, src_len, tag_seq):
 
         if config.use_gpu:
             _seq = src_seq.to(config.device)
@@ -112,7 +118,7 @@ class BeamSearcher(object):
         # forward encoder
         enc_outputs, enc_states = self.model.encoder(src_seq, src_len, tag_seq)
         h, c = enc_states  # [2, b, d] but b = 1
-        hypotheses = [Hypothesis(tokens=[self.tok2idx[START_TOKEN]],
+        hypotheses = [Hypothesis(tokens=[self.tok2idx["[CLS]"]],
                                  log_probs=[0.0],
                                  state=(h[:, 0, :], c[:, 0, :]),
                                  context=None) for _ in range(config.beam_size)]
@@ -127,7 +133,6 @@ class BeamSearcher(object):
         results = []
         while num_steps < config.max_decode_step and len(results) < config.beam_size:
             latest_tokens = [h.latest_token for h in hypotheses]
-            latest_tokens = [idx if idx < len(self.tok2idx) else UNK_ID for idx in latest_tokens]
             prev_y = torch.LongTensor(latest_tokens).view(-1)
 
             if config.use_gpu:
@@ -169,7 +174,7 @@ class BeamSearcher(object):
 
             hypotheses = []
             for h in self.sort_hypotheses(all_hypotheses):
-                if h.latest_token == END_ID:
+                if h.latest_token == self.tok2idx["[SEP]"]:
                     if num_steps >= config.min_decode_step:
                         results.append(h)
                 else:

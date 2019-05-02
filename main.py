@@ -1,13 +1,14 @@
-from trainer import Trainer
+from trainer import Trainer, DualTrainer, QGTrainer, C2ATrainer
 from infenrence import BeamSearcher
 import config
 
 
 def main():
     if config.train:
-        trainer = Trainer()
+        trainer = QGTrainer()
         trainer.train()
     else:
+        print("start decoding")
         beamsearcher = BeamSearcher(config.model_path, config.output_dir)
         beamsearcher.decode()
 
