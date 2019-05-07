@@ -1,13 +1,11 @@
 from model import Seq2seq
 import os
-from data_utils import START_TOKEN, END_ID, get_loader, UNK_ID, outputids2words
 from squad_utils import read_squad_examples, convert_examples_to_features
 from pytorch_pretrained_bert import BertTokenizer
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 import torch.nn.functional as F
 import config
-import pickle
 
 
 class Hypothesis(object):
@@ -37,17 +35,21 @@ class BeamSearcher(object):
     def __init__(self, model_path, output_dir):
         self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         self.output_dir = output_dir
-        # self.test_data = open(config.test_trg_file, "r").readlines()
         self.golden_q_ids = None
+        self.all_c_tokens = None
+        self.all_answer_text = None
         self.data_loader = self.get_data_loader("./squad/new_test-v1.1.json")
 
         self.tok2idx = self.tokenizer.vocab
         self.idx2tok = {idx: tok for tok, idx in self.tok2idx.items()}
-        self.model = Seq2seq(model_path=model_path, use_tag=True)
+        self.model = Seq2seq(dropout=0.0, model_path=model_path, use_tag=config.use_tag)
         self.model.requires_grad = False
         self.model.eval_mode()
-        self.pred_dir = output_dir + "/generated.txt"
-        self.golden_dir = output_dir + "/golden.txt"
+        self.src_file = output_dir + "/src.txt"
+        self.pred_file = output_dir + "/generated.txt"
+        self.golden_file = output_dir + "/golden.txt"
+        self.ans_file = output_dir + "/answer.txt"
+        self.total_file = output_dir + "/all_files.csv"
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
@@ -66,6 +68,9 @@ class BeamSearcher(object):
         all_tag_ids = torch.tensor([f.tag_ids for f in train_features], dtype=torch.long)
         train_data = TensorDataset(all_c_ids, all_c_lens, all_tag_ids, all_q_ids)
         train_loader = DataLoader(train_data, shuffle=False, batch_size=1)
+
+        self.all_c_tokens = [f.context_tokens for f in train_features]
+        self.all_answer_text = [f.answer_text for f in train_features]
         self.golden_q_ids = all_q_ids
 
         return train_loader
@@ -75,8 +80,10 @@ class BeamSearcher(object):
         return sorted(hypotheses, key=lambda h: h.avg_log_prob, reverse=True)
 
     def decode(self):
-        pred_fw = open(self.pred_dir, "w")
-        golden_fw = open(self.golden_dir, "w")
+        pred_fw = open(self.pred_file, "w")
+        golden_fw = open(self.golden_file, "w")
+        src_fw = open(self.src_file, "w")
+        ans_fw = open(self.ans_file, "w")
         for i, eval_data in enumerate(self.data_loader):
             c_ids, c_lens, tag_seq, q_ids = eval_data
             c_ids = c_ids.to(config.device)
@@ -87,7 +94,6 @@ class BeamSearcher(object):
             best_question = self.beam_search(c_ids, c_lens, tag_seq)
             # discard START  token
             output_indices = [int(idx) for idx in best_question.tokens[1:]]
-            # decoded_words = outputids2words(output_indices, self.idx2tok, oov_lst[0])
             decoded_words = self.tokenizer.convert_ids_to_tokens(output_indices)
             try:
                 fst_stop_idx = decoded_words.index("[SEP]")
@@ -100,12 +106,23 @@ class BeamSearcher(object):
             # discard [CLS], [SEP] and unnecessary PAD  tokens
             q_id = q_id[1:q_len - 1].cpu().numpy()
             golden_question = self.tokenizer.convert_ids_to_tokens(q_id)
+            answer_text = self.all_answer_text[i]
+            # de-tokenize src tokens
+            src_tokens = self.all_c_tokens[i]
+            # discard [CLS] and [SEP] tokens
+            src_txt = " ".join(src_tokens[1:-1])
+            src_txt = src_txt.replace(" ##", "")
+            src_txt = src_txt.replace("##", "").strip()
             print("write {}th question".format(i))
             pred_fw.write(decoded_words + "\n")
             golden_fw.write(" ".join(golden_question) + "\n")
+            src_fw.write(src_txt + "\n")
+            ans_fw.write(answer_text + "\n")
 
         pred_fw.close()
         golden_fw.close()
+        src_fw.close()
+        self.merge_files(self.total_file)
 
     def beam_search(self, src_seq, src_len, tag_seq):
 
@@ -188,3 +205,14 @@ class BeamSearcher(object):
         h_sorted = self.sort_hypotheses(results)
 
         return h_sorted[0]
+
+    def merge_files(self, output_file):
+        all_c_tokens = open(self.src_file, "r").readlines()
+        all_answer_text = open(self.ans_file, "r").readlines()
+        all_pred_q = open(self.pred_file, "r").readlines()
+        all_golden_q = open(self.golden_file, "r").readlines()
+        data = zip(all_c_tokens, all_answer_text, all_pred_q, all_golden_q)
+        with open(output_file, "w") as f:
+            for c_token, answer, pred_q, golden_q in data:
+                line = pred_q.strip() + "\t" + golden_q.strip() + "\t" + c_token.strip() + "\t" + answer.strip() + "\n"
+                f.write(line)

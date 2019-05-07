@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 from torch_scatter import scatter_max
-from data_utils import UNK_ID
 from pytorch_pretrained_bert import BertForQuestionAnswering, BertModel
 
 INF = 1e12
@@ -48,7 +47,7 @@ class Encoder(nn.Module):
         energies = energies.masked_fill(mask.unsqueeze(1), value=-1e12)
         scores = F.softmax(energies, dim=2)
         context = torch.matmul(scores, queries)
-        inputs = torch.cat([queries, context], dim=2)
+        inputs = torch.cat((queries, context), dim=2)
         f_t = torch.tanh(self.update_layer(inputs))
         g_t = torch.sigmoid(self.gate(inputs))
         updated_output = g_t * f_t + (1 - g_t) * queries
@@ -146,7 +145,7 @@ class Decoder(nn.Module):
             if config.use_pointer:
                 num_oov = max(torch.max(ext_src_seq - self.vocab_size + 1), 0)
                 zeros = torch.zeros((batch_size, num_oov), device=config.device)
-                extended_logit = torch.cat([logit, zeros], dim=1)
+                extended_logit = torch.cat((logit, zeros), dim=1)
                 out = torch.zeros_like(extended_logit) - INF
                 out, _ = scatter_max(energy, ext_src_seq, out=out)
                 out = out.masked_fill(out == -INF, 0)
@@ -176,7 +175,7 @@ class Decoder(nn.Module):
             batch_size = y.size(0)
             num_oov = max(torch.max(ext_x - self.vocab_size + 1), 0)
             zeros = torch.zeros((batch_size, num_oov), device=config.device)
-            extended_logit = torch.cat([logit, zeros], dim=1)
+            extended_logit = torch.cat((logit, zeros), dim=1)
             out = torch.zeros_like(extended_logit) - INF
             out, _ = scatter_max(energy, ext_x, out=out)
             out = out.masked_fill(out == -INF, 0)
@@ -225,7 +224,7 @@ class PointerDecoder(nn.Module):
     def attention(self, memories, mask, dec_hidden):
         nsteps = memories.size(1)
         tiled_hidden = dec_hidden.repeat([1, nsteps, 1])
-        concat_input = torch.cat([memories, tiled_hidden], dim=2)
+        concat_input = torch.cat((memories, tiled_hidden), dim=2)
         attn_features = torch.tanh(self.concat_layer(concat_input))
         energies = self.attention_layer(attn_features).squeeze(2)  # [b,t,1] -> [b,t]
         logit = energies.masked_fill(mask, -1e12)  # [b, t]
@@ -233,22 +232,21 @@ class PointerDecoder(nn.Module):
 
 
 class AnswerSelector(nn.Module):
-    def __init__(self, embedding=None, model_path=None):
+    def __init__(self, dropout, embedding=None, model_path=None):
         super(AnswerSelector, self).__init__()
         self.encoder = Encoder(embedding,
                                config.vocab_size,
                                config.embedding_size,
                                config.hidden_size,
                                config.num_layers,
-                               config.dropout,
+                               dropout,
                                use_tag=False)
         self.decoder = PointerDecoder(2 * config.hidden_size,
                                       config.num_layers,
-                                      config.dropout)
+                                      dropout)
         if model_path is not None:
             ckpt = torch.load(model_path)
-            self.encoder.load_state_dict(ckpt["encoder_state_dict"])
-            self.decoder.load_state_dict(ckpt["decoder_state_dict"])
+            self.load_state_dict(ckpt)
 
     def forward(self, src_seqs, src_len, start_positions):
         tag_seq = None
@@ -259,14 +257,14 @@ class AnswerSelector(nn.Module):
 
 
 class Seq2seq(nn.Module):
-    def __init__(self, embedding=None, use_tag=False, model_path=None):
+    def __init__(self, dropout, embedding=None, use_tag=False, model_path=None):
         super(Seq2seq, self).__init__()
         encoder = Encoder(embedding,
                           config.vocab_size,
                           config.embedding_size,
                           config.hidden_size,
                           config.num_layers,
-                          config.dropout,
+                          dropout,
                           use_tag)
 
         decoder = Decoder(embedding,
@@ -274,7 +272,7 @@ class Seq2seq(nn.Module):
                           config.embedding_size,
                           2 * config.hidden_size,
                           config.num_layers,
-                          config.dropout)
+                          dropout)
 
         if config.use_gpu and torch.cuda.is_available():
             device = torch.device(config.device)
@@ -304,17 +302,13 @@ class DualNet(nn.Module):
 
         self.qa_model = BertForQuestionAnswering.from_pretrained("bert-base-uncased")
 
-        self.ca2q_model = Seq2seq(None, use_tag=True,
+        self.ca2q_model = Seq2seq(dropout=0.0, embedding=None, use_tag=True,
                                   model_path=ca2q_model_path)
-        self.c2q_model = Seq2seq(None, use_tag=False,
+        self.c2q_model = Seq2seq(dropout=0.0, embedding=None, use_tag=False,
                                  model_path=c2q_model_path)
-        self.c2a_model = AnswerSelector(None, c2a_model_path)
-
-        # eval mode
-        self.c2q_model.encoder.eval()
-        self.c2q_model.decoder.eval()
-        self.c2a_model.encoder.eval()
-        self.c2a_model.decoder.eval()
+        self.c2a_model = AnswerSelector(dropout=0.0,
+                                        embedding=None,
+                                        model_path=c2a_model_path)
 
         # freeze pre-trained c2q and c2a models
         self.c2q_model.requires_grad = False
@@ -333,7 +327,7 @@ class DualNet(nn.Module):
         c_ids = c_ids[:, :max_c_len]
         tag_ids = tag_ids[:, :max_c_len]
 
-        q_lens = torch.sum(torch.sign(q_ids),1 )
+        q_lens = torch.sum(torch.sign(q_ids), 1)
         max_q_len = torch.max(q_lens)
         q_ids = q_ids[:, :max_q_len]
 
@@ -366,6 +360,7 @@ class DualNet(nn.Module):
         eos_q_ids = q_ids[:, 1:]
         q_logits = self.c2q_model.decoder(sos_q_ids, c_ids, enc_states, enc_outputs)
         batch_size, nsteps, _ = q_logits.size()
+
         criterion = nn.CrossEntropyLoss(ignore_index=0)
         preds = q_logits.view(batch_size * nsteps, -1)
         targets = eos_q_ids.contiguous().view(-1)
@@ -378,7 +373,7 @@ class DualNet(nn.Module):
         ca2q_loss = criterion(preds, targets)
 
         # answer span without question
-        logits = self.c2a_decoder(c_ids, c_lens, start_positions)
+        logits = self.c2a_model(c_ids, c_lens, noq_start_positions)
         start_logits, end_logits = logits
 
         ignored_index = start_logits.size(1)

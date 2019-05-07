@@ -1,7 +1,7 @@
 import os
 import pickle
 import time
-
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -154,7 +154,7 @@ class QGTrainer(object):
         # load Bert Tokenizer and pre-trained word embedding
         self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         embeddings = None
-        self.model = Seq2seq(embeddings, use_tag=config.use_tag)
+        self.model = Seq2seq(config.dropout, embeddings, use_tag=config.use_tag)
 
         train_dir = os.path.join("./save", "c2q")
 
@@ -297,7 +297,7 @@ class C2ATrainer(object):
     def __init__(self):
         self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         # instantiate class and allocate it to gpu device
-        self.model = AnswerSelector().to(config.device)
+        self.model = AnswerSelector(config.dropout).to(config.device)
         train_dir = os.path.join("./save", "c2a")
         self.train_loader = self.get_data_loader("./squad/train-v1.1.json")
         self.dev_loader = self.get_data_loader("./squad/new_dev-v1.1.json")
@@ -323,7 +323,6 @@ class C2ATrainer(object):
         all_noq_end_positions = torch.tensor([f.noq_end_position for f in train_features], dtype=torch.long)
 
         train_data = TensorDataset(all_c_ids, all_c_lens, all_noq_start_positions, all_noq_end_positions)
-
         train_loader = DataLoader(train_data, shuffle=True, batch_size=config.batch_size)
 
         return train_loader
@@ -405,17 +404,16 @@ class C2ATrainer(object):
 
 
 class DualTrainer(object):
-    def __init__(self, c2q_model_path, c2a_model_path):
+    def __init__(self, ca2q_model_path, c2q_model_path, c2a_model_path):
         self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-        self.model = DualNet(c2q_model_path, c2a_model_path)
-        self.save_dir = os.path.join("./save", "dual")
-        self.num_train = None
+        self.model = DualNet(ca2q_model_path, c2q_model_path, c2a_model_path)
+        train_dir = os.path.join("./save", "dual")
+        self.save_dir = os.path.join(train_dir, "train_%d" % int(time.strftime("%m%d%H%M%S")))
         # read data-set and prepare iterator
         self.train_loader = self.get_data_loader("./squad/train-v1.1.json")
         self.dev_loader = self.get_data_loader("./squad/new_dev-v1.1.json")
 
-        num_train_optimization_steps = int(
-            self.num_train / config.batch_size / config.gradient_accumulation_steps) * config.num_epochs
+        num_train_optimization_steps = len(self.train_loader) * config.num_epochs
         # optimizer
         param_optimizer = list(self.model.qa_model.named_parameters())
         # hack to remove pooler, which is not used
@@ -433,8 +431,8 @@ class DualTrainer(object):
 
         params = list(self.model.ca2q_model.encoder.parameters()) \
                  + list(self.model.ca2q_model.decoder.parameters())
-        self.qg_lr = config.lr
-        self.qg_opt = optim.SGD(params, lr=self.qg_lr)
+        # self.qg_lr = config.lr
+        self.qg_opt = optim.Adam(params, config.qa_lr)
 
         # assign model to device and wrap it with DataParallel
         torch.cuda.set_device(0)
@@ -449,9 +447,8 @@ class DualTrainer(object):
                                                       max_query_length=config.max_query_len,
                                                       doc_stride=128,
                                                       is_training=True)
-        self.num_train = len(train_examples)
         all_c_ids = torch.tensor([f.c_ids for f in train_features], dtype=torch.long)
-        all_c_lens = torch.sign(torch.sum(all_c_ids, 1)).long()
+        all_c_lens = torch.sum(torch.sign(all_c_ids), 1)
         all_tag_ids = torch.tensor([f.tag_ids for f in train_features], dtype=torch.long)
         all_q_ids = torch.tensor([f.q_ids for f in train_features], dtype=torch.long)
         all_input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
@@ -468,13 +465,16 @@ class DualTrainer(object):
                                    all_noq_start_positions, all_noq_end_positions)
 
         sampler = RandomSampler(train_data)
-        train_loader = DataLoader(train_data, sampler=sampler, batch_size=config.batch_size)
+        batch_size = int(config.batch_size / config.gradient_accumulation_steps)
+        train_loader = DataLoader(train_data, sampler=sampler, batch_size=batch_size)
 
         return train_loader
 
-    def save_model(self, accuracy, epoch):
-        acc = round(accuracy, 3)
-        dir_name = os.path.join(self.save_dir, "{:.3f}_{}".format(acc, epoch))
+    def save_model(self, loss, epoch):
+        loss = round(loss, 3)
+        dir_name = os.path.join(self.save_dir, "bert_{}_{:.3f}".format(epoch, loss))
+        if not os.path.exists(dir_name):
+            os.makedirs(dir_name)
         # save bert model
         model_to_save = self.model.module.qa_model if hasattr(self.model, "module") else self.model.qa_model
         model_file = os.path.join(dir_name, "pytorch_model.bin")
@@ -482,43 +482,57 @@ class DualTrainer(object):
 
         state_dict = model_to_save.state_dict()
         torch.save(state_dict, model_file)
-        json_file = model_to_save.config.to_json_file(config_file)
-        with open(config_file, "w") as f:
-            f.write(json_file)
+        model_to_save.config.to_json_file(config_file)
+        # save qg model
+        model_to_save = self.model.module.ca2q_model if hasattr(self.model, "module") else self.model.ca2q_model
+        file = os.path.join(self.save_dir, "{}_{:.3f}".format(epoch, loss))
+        state_dict = {
+            "encoder_state_dict": model_to_save.encoder.state_dict(),
+            "decoder_state_dict": model_to_save.decoder.state_dict()
+        }
+        torch.save(state_dict, file)
 
     def train(self):
         global_step = 1
         batch_num = len(self.train_loader)
-        self.model.module.qa_model.train()
-        self.model.module.ca2q_model.train()
         best_loss = 1e10
+        qa_loss_lst = []
+        qg_loss_lst = []
         for epoch in range(1, config.num_epochs + 1):
             start = time.time()
-            for batch_idx, batch in enumerate(self.train_loader, start=1):
+            for step, batch in enumerate(self.train_loader, start=1):
                 qa_loss, ca2q_loss = self.model(batch)
-                # zero grad
-                self.qa_opt.zero_grad()
-                self.qg_opt.zero_grad()
+
                 # mean() to average across multiple gpu and back-propagation
-                qa_loss = qa_loss.mean()
-                ca2q_loss = ca2q_loss.mean()
+                qa_loss = qa_loss.mean() / config.gradient_accumulation_steps
+                ca2q_loss = ca2q_loss.mean() / config.gradient_accumulation_steps
 
                 qa_loss.backward(retain_graph=True)
                 ca2q_loss.backward()
 
+                qa_loss_lst.append(qa_loss.detach().item())
+                qg_loss_lst.append(ca2q_loss.detach().item())
                 # clip gradient
-                nn.utils.clip_grad_norm_(self.model.module.c_encoder.parameters(), config.max_grad_norm)
                 nn.utils.clip_grad_norm_(self.model.module.ca2q_model.parameters(), config.max_grad_norm)
 
                 # update params
-                self.qa_opt.step()
-                self.qg_opt.step()
-                global_step += 1
-                msg = "{}/{} {} - ETA : {} - qa_loss: {:.2f}, ca2q_loss :{:.2f}" \
-                    .format(batch_idx, batch_num, progress_bar(batch_idx, batch_num),
-                            eta(start, batch_idx, batch_num),
-                            qa_loss.item(), ca2q_loss.item())
-                print(msg, end="\r")
+                if step % config.gradient_accumulation_steps == 0:
+                    self.qa_opt.step()
+                    self.qg_opt.step()
+                    # zero grad
+                    self.qa_opt.zero_grad()
+                    self.qg_opt.zero_grad()
+                    global_step += 1
+                    avg_qa_loss = sum(qa_loss_lst)
+                    avg_qg_loss = sum(qg_loss_lst)
+                    # empty list
+                    qa_loss_lst = []
+                    qg_loss_lst = []
+                    msg = "{}/{} {} - ETA : {} - qa_loss: {:.2f}, ca2q_loss :{:.2f}" \
+                        .format(step, batch_num, progress_bar(step, batch_num),
+                                eta(start, step, batch_num),
+                                avg_qa_loss, avg_qg_loss)
+                    print(msg, end="\r")
 
             val_qa_loss, val_qg_loss = self.evaluate(msg)
             if val_qg_loss <= best_loss:
@@ -526,11 +540,11 @@ class DualTrainer(object):
                 self.save_model(val_qg_loss, epoch)
 
             print("Epoch {} took {} - final loss : {:.4f} -  qa_loss :{:.4f}, qg_loss :{:.4f}"
-                  .format(epoch, user_friendly_time(time_since(start)), batch_loss, val_qg_loss))
+                  .format(epoch, user_friendly_time(time_since(start)), ca2q_loss, val_qa_loss, val_qg_loss))
 
     def evaluate(self, msg):
         self.model.module.qa_model.eval()
-        self.model.module.ca2_model.eval_mode()
+        self.model.module.ca2q_model.eval_mode()
         num_val_batches = len(self.dev_loader)
         val_qa_losses = []
         val_qg_losses = []
@@ -538,11 +552,12 @@ class DualTrainer(object):
             with torch.no_grad():
                 val_batch_loss = self.model(val_data)
                 qa_loss, qg_loss = val_batch_loss
-                val_qa_losses.append(qa_loss.item())
-                val_qg_losses.append(qg_loss.item())
+                val_qa_losses.append(qa_loss.mean().item())
+                val_qg_losses.append(qg_loss.mean().item())
                 msg2 = "{} => Evaluating :{}/{}".format(msg, i, num_val_batches)
                 print(msg2, end="\r")
         val_qa_loss = np.mean(val_qa_losses)
         val_qg_loss = np.mean(val_qg_losses)
-
+        self.model.module.qa_model.train()
+        self.model.module.ca2q_model.train_mode()
         return val_qa_loss, val_qg_loss

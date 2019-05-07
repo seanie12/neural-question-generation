@@ -11,16 +11,19 @@ test_trg_file = "./squad/tgt-test.txt"
 embedding = "./data/embedding.pkl"
 word2idx_file = "./data/word2idx.pkl"
 
-model_path = "./save/c2q/train_502103227/20_2.83"
-train = True
-device = "cuda:1"
+ca2q_path = "./save/c2q/best_with_ans/20_2.83"
+c2q_path = "./save/c2q/qg_no_ans/16_3.0"
+c2a_path = "./save/c2a/selector/2_2.43"
+model_path = "./save/dual/train_506144932/1_2.890"
+train = False
+device = "cuda:0"
 use_gpu = True
 debug = False
 vocab_size = 30522
 
 num_epochs = 20
 max_length = 400
-max_seq_len = 400
+max_seq_len = 384
 max_query_len = 64
 num_layers = 2
 hidden_size = 300
@@ -28,19 +31,19 @@ embedding_size = 768
 
 # QA config
 qa_lr = 5e-5
-gradient_accumulation_steps = 1
+gradient_accumulation_steps = 8
 warmup_proportion = 0.1
 dual_lambda = 0.1
+
 
 lr = 0.1
 batch_size = 64
 dropout = 0.3
 max_grad_norm = 5.0
 
-
 use_tag = True
 use_pointer = True
 beam_size = 10
 min_decode_step = 8
 max_decode_step = 40
-output_dir = "./result/bert_embeddings_ans"
+output_dir = "./result/dual_learning"
