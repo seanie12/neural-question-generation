@@ -297,10 +297,10 @@ class Seq2seq(nn.Module):
 
 
 class DualNet(nn.Module):
-    def __init__(self, ca2q_model_path, c2q_model_path, c2a_model_path):
+    def __init__(self, qa_model_path, ca2q_model_path, c2q_model_path, c2a_model_path):
         super(DualNet, self).__init__()
 
-        self.qa_model = BertForQuestionAnswering.from_pretrained("bert-base-uncased")
+        self.qa_model = BertForQuestionAnswering.from_pretrained(qa_model_path)
 
         self.ca2q_model = Seq2seq(dropout=0.0, embedding=None, use_tag=True,
                                   model_path=ca2q_model_path)

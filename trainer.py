@@ -1,7 +1,6 @@
 import os
 import pickle
 import time
-import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -403,10 +402,145 @@ class C2ATrainer(object):
         return val_loss
 
 
-class DualTrainer(object):
-    def __init__(self, ca2q_model_path, c2q_model_path, c2a_model_path):
+class QATrainer(object):
+    def __init__(self):
         self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-        self.model = DualNet(ca2q_model_path, c2q_model_path, c2a_model_path)
+        self.model = BertForQuestionAnswering.from_pretrained("bert-base-uncased")
+        train_dir = os.path.join("./save", "qa")
+        self.save_dir = os.path.join(train_dir, "train_%d" % int(time.strftime("%m%d%H%M%S")))
+        if not os.path.exists(self.save_dir):
+            os.makedirs(self.save_dir)
+        # read data-set and prepare iterator
+        self.train_loader = self.get_data_loader("./squad/train-v1.1.json")
+        self.dev_loader = self.get_data_loader("./squad/new_dev-v1.1.json")
+
+        num_train_optimization_steps = len(self.train_loader) * config.num_epochs
+        # optimizer
+        param_optimizer = list(self.model.named_parameters())
+        # hack to remove pooler, which is not used
+        # thus it produce None grad that break apex
+        param_optimizer = [n for n in param_optimizer if "pooler" not in n[0]]
+        no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
+            {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+        ]
+        self.qa_opt = BertAdam(optimizer_grouped_parameters,
+                               lr=config.qa_lr,
+                               warmup=config.warmup_proportion,
+                               t_total=num_train_optimization_steps)
+
+        # self.qg_lr = config.lr
+
+        # assign model to device
+        self.model = self.model.to(config.device)
+
+    def get_data_loader(self, file):
+        train_examples = read_squad_examples(file, is_training=True, debug=config.debug)
+        train_features = convert_examples_to_features(train_examples,
+                                                      tokenizer=self.tokenizer,
+                                                      max_seq_length=config.max_seq_len,
+                                                      max_query_length=config.max_query_len,
+                                                      doc_stride=128,
+                                                      is_training=True)
+        all_input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
+        all_input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long)
+        all_segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long)
+        all_start_positions = torch.tensor([f.start_position for f in train_features], dtype=torch.long)
+        all_end_positions = torch.tensor([f.end_position for f in train_features], dtype=torch.long)
+
+        train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids,
+                                   all_start_positions, all_end_positions)
+
+        sampler = RandomSampler(train_data)
+        batch_size = int(config.batch_size / config.gradient_accumulation_steps)
+        train_loader = DataLoader(train_data, sampler=sampler, batch_size=batch_size)
+
+        return train_loader
+
+    def save_model(self, loss, epoch):
+        loss = round(loss, 3)
+        dir_name = os.path.join(self.save_dir, "bert_{}_{:.3f}".format(epoch, loss))
+        if not os.path.exists(dir_name):
+            os.makedirs(dir_name)
+        # save bert model
+        model_to_save = self.model.module if hasattr(self.model, "module") else self.model
+        model_file = os.path.join(dir_name, "pytorch_model.bin")
+        config_file = os.path.join(dir_name, "bert_config.json")
+
+        state_dict = model_to_save.state_dict()
+        torch.save(state_dict, model_file)
+        model_to_save.config.to_json_file(config_file)
+
+    def train(self):
+        global_step = 1
+        batch_num = len(self.train_loader)
+        best_loss = 1e10
+        qa_loss_lst = []
+        self.model.train()
+        for epoch in range(1, 4):
+            start = time.time()
+            for step, batch in enumerate(self.train_loader, start=1):
+
+                input_ids, input_mask, segment_ids, start_positions, end_positions = batch
+                seq_len = torch.sum(torch.sign(input_ids), 1)
+                max_len = torch.max(seq_len)
+                input_ids = input_ids[:, :max_len].to(config.device)
+                input_mask = input_mask[:, : max_len].to(config.device)
+                segment_ids = segment_ids[:, :max_len].to(config.device)
+                start_positions = start_positions.to(config.device)
+                end_positions = end_positions.to(config.device)
+                loss = self.model(input_ids, segment_ids, input_mask, start_positions, end_positions)
+
+                # mean() to average across multiple gpu and back-propagation
+                loss /= config.gradient_accumulation_steps
+                loss.backward()
+                qa_loss_lst.append(loss)
+                # update params
+                if step % config.gradient_accumulation_steps == 0:
+                    self.qa_opt.step()
+                    # zero grad
+                    self.qa_opt.zero_grad()
+                    global_step += 1
+                    avg_qa_loss = sum(qa_loss_lst)
+                    # empty list
+                    qa_loss_lst = []
+                    msg = "{}/{} {} - ETA : {} - qa_loss: {:.2f}" \
+                        .format(step, batch_num, progress_bar(step, batch_num),
+                                eta(start, step, batch_num),
+                                avg_qa_loss)
+                    print(msg, end="\r")
+
+            val_loss = self.evaluate(msg)
+            if val_loss <= best_loss:
+                best_loss = val_loss
+                self.save_model(val_loss, epoch)
+
+            print("Epoch {} took {} - final loss : {:.4f} -  val_loss :{:.4f}"
+                  .format(epoch, user_friendly_time(time_since(start)), loss, val_loss))
+
+    def evaluate(self, msg):
+        self.model.eval()
+        num_val_batches = len(self.dev_loader)
+        val_losses = []
+        for i, val_data in enumerate(self.dev_loader, start=1):
+            with torch.no_grad():
+                val_data = tuple(t.to(config.device) for t in val_data)
+                input_ids, input_mask, segment_ids, start_positions, end_positions = val_data
+                val_batch_loss = self.model(input_ids, segment_ids, input_mask, start_positions, end_positions)
+                qa_loss = val_batch_loss
+                val_losses.append(qa_loss.mean().item())
+                msg2 = "{} => Evaluating :{}/{}".format(msg, i, num_val_batches)
+                print(msg2, end="\r")
+        val_loss = np.mean(val_losses)
+        self.model.train()
+        return val_loss
+
+
+class DualTrainer(object):
+    def __init__(self, qa_model_path, ca2q_model_path, c2q_model_path, c2a_model_path):
+        self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+        self.model = DualNet(qa_model_path, ca2q_model_path, c2q_model_path, c2a_model_path)
         train_dir = os.path.join("./save", "dual")
         self.save_dir = os.path.join(train_dir, "train_%d" % int(time.strftime("%m%d%H%M%S")))
         # read data-set and prepare iterator
