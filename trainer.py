@@ -436,7 +436,8 @@ class QATrainer(object):
         self.model = self.model.to(config.device)
 
     def get_data_loader(self, file):
-        train_examples = read_squad_examples(file, is_training=True, debug=config.debug)
+        train_examples = read_squad_examples(file, is_training=True, debug=config.debug,
+                                             reduce_size=config.reduce_size)
         train_features = convert_examples_to_features(train_examples,
                                                       tokenizer=self.tokenizer,
                                                       max_seq_length=config.max_seq_len,

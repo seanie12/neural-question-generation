@@ -1,3 +1,4 @@
+import random
 import json
 from pytorch_pretrained_bert.tokenization import whitespace_tokenize, BasicTokenizer
 import collections
@@ -170,8 +171,9 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
                     start_position = tok_start_position - doc_start + doc_offset
                     end_position = tok_end_position - doc_start + doc_offset
 
-                    noq_start_position = tok_start_position - doc_start
-                    noq_end_position = tok_end_position - doc_start
+                    # plus one for [CLS] token
+                    noq_start_position = tok_start_position - doc_start + 1
+                    noq_end_position = tok_end_position - doc_start + 1
 
                 if out_of_span:
                     continue
@@ -197,9 +199,9 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
             # BIO tagging scheme
             tag_ids = [0] * len(c_ids)  # Outside
             if noq_start_position is not None and noq_end_position is not None:
-                tag_ids[noq_start_position + 1] = 1  # Begin
+                tag_ids[noq_start_position] = 1  # Begin
                 # Inside tag
-                for idx in range(noq_start_position + 2, noq_end_position + 2):
+                for idx in range(noq_start_position + 1, noq_end_position + 1):
                     tag_ids[idx] = 2
             if is_training:
                 assert 1 in tag_ids
@@ -277,7 +279,8 @@ class InputFeatures(object):
         self.is_impossible = is_impossible
 
 
-def read_squad_examples(input_file, is_training, version_2_with_negative=False, debug=False):
+def read_squad_examples(input_file, is_training, version_2_with_negative=False,
+                        debug=False, reduce_size=False):
     """Read a SQuAD json file into a list of SquadExample."""
     with open(input_file, "r", encoding='utf-8') as reader:
         input_data = json.load(reader)["data"]
@@ -290,8 +293,17 @@ def read_squad_examples(input_file, is_training, version_2_with_negative=False, 
     examples = []
     if debug:
         input_data = input_data[:10]
+
     for entry in input_data:
-        for paragraph in entry["paragraphs"]:
+        paragraphs = entry["paragraphs"]
+
+        # shuffle paragraphs and get only half of them
+        if reduce_size:
+            random.seed(1004)
+            end_idx = int(len(paragraphs) * 0.5)
+            paragraphs = paragraphs[:end_idx]
+
+        for paragraph in paragraphs:
             paragraph_text = paragraph["context"]
             doc_tokens = []
             char_to_word_offset = []
