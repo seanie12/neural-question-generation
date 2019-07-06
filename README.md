@@ -33,4 +33,4 @@ python2 eval.py --out_file prediction_file --src_file src_file --tgt_file target
 ## Results 
 |  <center>BLEU_1</center> |  <center>BLEU_2</center> |  <center>BLEU_3</center> | <center>BLEU_4</center> |
 |:--------|:--------:|--------:|--------:|
-|<center>44.575 </center> | <center>29.34 </center> |<center> 21.74</center>| <center>16.28</center>|
+|<center>44.57 </center> | <center>29.34 </center> |<center> 21.74</center>| <center>16.28</center>|
