@@ -106,8 +106,7 @@ class Trainer(object):
             src_seq, ext_src_seq, src_len, trg_seq, ext_trg_seq, trg_len, _ = train_data
             tag_seq = None
         src_len = torch.LongTensor(src_len)
-        enc_zeros = torch.zeros_like(src_seq)
-        enc_mask = torch.ByteTensor(src_seq == enc_zeros)
+        enc_mask = (src_seq == 0).byte()
 
         if config.use_gpu:
             src_seq = src_seq.to(config.device)
