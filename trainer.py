@@ -17,7 +17,8 @@ class Trainer(object):
         # load dictionary and embedding file
         with open(config.embedding, "rb") as f:
             embedding = pickle.load(f)
-            embedding = torch.Tensor(embedding).to(config.device)
+            embedding = torch.tensor(embedding,
+                                     dtype=torch.float).to(config.device)
         with open(config.word2idx_file, "rb") as f:
             word2idx = pickle.load(f)
 
@@ -105,7 +106,7 @@ class Trainer(object):
         else:
             src_seq, ext_src_seq, src_len, trg_seq, ext_trg_seq, trg_len, _ = train_data
             tag_seq = None
-        src_len = torch.LongTensor(src_len)
+        src_len = torch.tensor(src_len, dtype=torch.long)
         enc_mask = (src_seq == 0).byte()
 
         if config.use_gpu:
