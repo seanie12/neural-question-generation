@@ -1,6 +1,6 @@
 # Neural Question Generation
-This is not official implementation for the paper [Paragraph-level Neural Question Generation with Maxout Pointer and Gated Self-attention Networks](https://www.aclweb.org/anthology/D18-1424)
- I implemented in Pytorch to reproduce similar result as the paper
+This is not official implementation for the paper [Paragraph-level Neural Question Generation with Maxout Pointer and Gated Self-attention Networks](https://www.aclweb.org/anthology/D18-1424).
+ I implemented in Pytorch to reproduce similar result as the paper.
 
 ## Dependencies
 This code is written in Python. Dependencies include
