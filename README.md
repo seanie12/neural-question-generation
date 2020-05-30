@@ -1,11 +1,11 @@
 # Neural Question Generation
 This is not official implementation for the paper [Paragraph-level Neural Question Generation with Maxout Pointer and Gated Self-attention Networks](https://www.aclweb.org/anthology/D18-1424).
- I implemented in Pytorch to reproduce similar result as the paper.
+ I implemented in Pytorch to reproduce similar result as the paper. The checkpoint of pretrained model is at the file path ./save/model.pt
 
 ## Dependencies
 This code is written in Python. Dependencies include
 * python >= 3.6
-* pytorch >= 1.0
+* pytorch >= 1.4
 * nltk
 * tqdm
 * [pytorch_scatter](https://github.com/rusty1s/pytorch_scatter)
@@ -22,7 +22,7 @@ python process_data.py
 ```
 ## Configuration
 You might need to change configuration in config.py. <br />
-If you want to train, change train = True  and set gpu device in config.py
+If you want to train, change train = True  and set the gpu device in config.py
 
 
 ## Evaluation from this [repository](https://github.com/xinyadu/nqg)
@@ -33,4 +33,4 @@ python2 eval.py --out_file prediction_file --src_file src_file --tgt_file target
 ## Results 
 |  <center>BLEU_1</center> |  <center>BLEU_2</center> |  <center>BLEU_3</center> | <center>BLEU_4</center> |
 |:--------|:--------:|--------:|--------:|
-|<center>44.57 </center> | <center>29.34 </center> |<center> 21.74</center>| <center>16.28</center>|
+|<center> 45.22 </center> | <center> 29.94 </center> |<center> 22.01</center>| <center>16.76</center>|
