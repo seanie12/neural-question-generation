@@ -27,13 +27,13 @@ class Trainer(object):
         self.train_loader = get_loader(config.train_src_file,
                                        config.train_trg_file,
                                        word2idx,
-                                       use_tag=config.use_tag,
+                                       use_tag=True,
                                        batch_size=config.batch_size,
                                        debug=config.debug)
         self.dev_loader = get_loader(config.dev_src_file,
                                      config.dev_trg_file,
                                      word2idx,
-                                     use_tag=config.use_tag,
+                                     use_tag=True,
                                      batch_size=128,
                                      debug=config.debug)
 

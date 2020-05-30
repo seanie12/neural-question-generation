@@ -1,7 +1,12 @@
+import sys
+
+sys.path.insert(0, '../')
+
 import config
-from data_utils import make_embedding, make_vocab_from_squad, \
-    process_file, make_conll_format, \
-    make_vocab
+from data_utils import (make_conll_format, make_embedding, make_vocab,
+                        make_vocab_from_squad, process_file)
+
+
 
 
 def make_sent_dataset():
