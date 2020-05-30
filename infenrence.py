@@ -41,16 +41,26 @@ class BeamSearcher(object):
                                       config.test_trg_file,
                                       word2idx,
                                       batch_size=1,
-                                      use_tag=config.use_tag,
+                                      use_tag=True,
                                       shuffle=False)
 
         self.tok2idx = word2idx
         self.idx2tok = {idx: tok for tok, idx in self.tok2idx.items()}
-        self.model = Seq2seq(model_path=model_path)
-        self.pred_dir = output_dir + "/generated.txt"
-        self.golden_dir = output_dir + "/golden.txt"
+        self.model = Seq2seq()
+        state_dict = torch.load(model_path)
+        self.model.load_state_dict(state_dict)
+        self.model.eval()
+        self.moddel = self.model.to(config.device)
+        self.pred_dir = os.path.join(output_dir, "/generated.txt")
+        self.golden_dir = os.path.join(output_dir, "/golden.txt")
+        self.src_file = os.path.join(output_dir, "src.txt")
+        
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
+        # dummy file for evaluation
+        with open(self.src_file, "w") as f:
+            for i in range(len(self.data_loader)):
+                f.write(i+"\n")
 
     @staticmethod
     def sort_hypotheses(hypotheses):
@@ -60,17 +70,14 @@ class BeamSearcher(object):
         pred_fw = open(self.pred_dir, "w")
         golden_fw = open(self.golden_dir, "w")
         for i, eval_data in enumerate(self.data_loader):
-            if config.use_tag:
-                src_seq, ext_src_seq, src_len, trg_seq, \
-                ext_trg_seq, trg_len, tag_seq, oov_lst = eval_data
-            else:
-                src_seq, ext_src_seq, src_len, \
-                trg_seq, ext_trg_seq, trg_len, oov_lst = eval_data
-                tag_seq = None
-            best_question = self.beam_search(src_seq, ext_src_seq, src_len, tag_seq)
+            src_seq, ext_src_seq, _, \
+                _, tag_seq, oov_lst = eval_data
+
+            best_question = self.beam_search(src_seq, ext_src_seq, tag_seq)
             # discard START  token
             output_indices = [int(idx) for idx in best_question.tokens[1:-1]]
-            decoded_words = outputids2words(output_indices, self.idx2tok, oov_lst[0])
+            decoded_words = outputids2words(
+                output_indices, self.idx2tok, oov_lst[0])
             try:
                 fst_stop_idx = decoded_words.index(END_ID)
                 decoded_words = decoded_words[:fst_stop_idx]
@@ -78,17 +85,16 @@ class BeamSearcher(object):
                 decoded_words = decoded_words
             decoded_words = " ".join(decoded_words)
             golden_question = self.test_data[i]
-            print("write {}th question".format(i))
+            print("write {}th question\r".format(i))
             pred_fw.write(decoded_words + "\n")
             golden_fw.write(golden_question)
 
         pred_fw.close()
         golden_fw.close()
 
-    def beam_search(self, src_seq, ext_src_seq, src_len, tag_seq):
-        zeros = torch.zeros_like(src_seq)
-        enc_mask = torch.ByteTensor(src_seq == zeros)
-        src_len = torch.LongTensor(src_len)
+    def beam_search(self, src_seq, ext_src_seq, tag_seq):
+        enc_mask = torch.sign(src_seq)
+        src_len = torch.sum(enc_mask, 1)
         prev_context = torch.zeros(1, 1, 2 * config.hidden_size)
 
         if config.use_gpu:
@@ -97,9 +103,7 @@ class BeamSearcher(object):
             src_len = src_len.to(config.device)
             enc_mask = enc_mask.to(config.device)
             prev_context = prev_context.to(config.device)
-
-            if config.use_tag:
-                tag_seq = tag_seq.to(config.device)
+            tag_seq = tag_seq.to(config.device)
         # forward encoder
         enc_outputs, enc_states = self.model.encoder(src_seq, src_len, tag_seq)
         h, c = enc_states  # [2, b, d] but b = 1
@@ -116,8 +120,9 @@ class BeamSearcher(object):
         results = []
         while num_steps < config.max_decode_step and len(results) < config.beam_size:
             latest_tokens = [h.latest_token for h in hypotheses]
-            latest_tokens = [idx if idx < len(self.tok2idx) else UNK_ID for idx in latest_tokens]
-            prev_y = torch.LongTensor(latest_tokens).view(-1)
+            latest_tokens = [idx if idx < len(
+                self.tok2idx) else UNK_ID for idx in latest_tokens]
+            prev_y = torch.tensor(latest_tokens, dtype=torch.long).view(-1)
 
             if config.use_gpu:
                 prev_y = prev_y.to(config.device)

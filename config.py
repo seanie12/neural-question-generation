@@ -11,9 +11,9 @@ test_trg_file = "./squad/tgt-test.txt"
 embedding = "./data/embedding.pkl"
 word2idx_file = "./data/word2idx.pkl"
 
-model_path = "./save/seq2seq/train_422203728/20_2.68"
-train = False
-device = "cuda:1"
+model_path = "./save/model.pt"
+
+device = "cuda:0"
 use_gpu = True
 debug = False
 vocab_size = 45000
@@ -29,7 +29,6 @@ batch_size = 64
 dropout = 0.3
 max_grad_norm = 5.0
 
-use_tag = True
 use_pointer = True
 beam_size = 10
 min_decode_step = 8

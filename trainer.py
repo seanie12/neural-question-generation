@@ -13,7 +13,7 @@ from model import Seq2seq
 
 
 class Trainer(object):
-    def __init__(self, model_path=None):
+    def __init__(self, args):
         # load dictionary and embedding file
         with open(config.embedding, "rb") as f:
             embedding = pickle.load(f)
@@ -38,13 +38,21 @@ class Trainer(object):
                                      debug=config.debug)
 
         train_dir = os.path.join("./save", "seq2seq")
-        self.model_dir = os.path.join(train_dir, "train_%d" % int(time.strftime("%m%d%H%M%S")))
+        self.model_dir = os.path.join(
+            train_dir, "train_%d" % int(time.strftime("%m%d%H%M%S")))
         if not os.path.exists(self.model_dir):
             os.makedirs(self.model_dir)
 
-        self.model = Seq2seq(embedding, model_path=model_path)
-        params = list(self.model.encoder.parameters()) \
-                 + list(self.model.decoder.parameters())
+        self.model = Seq2seq(embedding)
+        self.model = self.model.to(config.device)
+
+        if len(args.model_path) > 0:
+            print("load check point from: {}".format(args.model_path))
+            state_dict = torch.load(args.model_path,
+                                    map_location="cpu")
+            self.model.load_state_dict(state_dict)
+
+        params = self.model.parameters()
 
         self.lr = config.lr
         self.optim = optim.SGD(params, self.lr, momentum=0.8)
@@ -52,21 +60,17 @@ class Trainer(object):
         self.criterion = nn.CrossEntropyLoss(ignore_index=0)
 
     def save_model(self, loss, epoch):
-        state_dict = {
-            "epoch": epoch,
-            "current_loss": loss,
-            "encoder_state_dict": self.model.encoder.state_dict(),
-            "decoder_state_dict": self.model.decoder.state_dict()
-        }
+        state_dict = self.model.state_dict()
         loss = round(loss, 2)
-        model_save_path = os.path.join(self.model_dir, str(epoch) + "_" + str(loss))
+        model_save_path = os.path.join(
+            self.model_dir, str(epoch) + "_" + str(loss))
         torch.save(state_dict, model_save_path)
 
     def train(self):
         batch_num = len(self.train_loader)
-        self.model.train_mode()
         best_loss = 1e10
         for epoch in range(1, config.num_epochs + 1):
+            self.model.train()
             print("epoch {}/{} :".format(epoch, config.num_epochs), end="\r")
             start = time.time()
             # halving the learning rate after epoch 8
@@ -80,11 +84,12 @@ class Trainer(object):
             for batch_idx, train_data in enumerate(self.train_loader, start=1):
                 batch_loss = self.step(train_data)
 
-                self.optim.zero_grad()
+                self.model.zero_grad()
                 batch_loss.backward()
                 # gradient clipping
-                nn.utils.clip_grad_norm_(self.model.encoder.parameters(), config.max_grad_norm)
-                nn.utils.clip_grad_norm_(self.model.decoder.parameters(), config.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.model.parameters(),
+                                         config.max_grad_norm)
+
                 self.optim.step()
                 batch_loss = batch_loss.detach().item()
                 msg = "{}/{} {} - ETA : {} - loss : {:.4f}" \
@@ -101,13 +106,9 @@ class Trainer(object):
                   .format(epoch, user_friendly_time(time_since(start)), batch_loss, val_loss))
 
     def step(self, train_data):
-        if config.use_tag:
-            src_seq, ext_src_seq, src_len, trg_seq, ext_trg_seq, trg_len, tag_seq, _ = train_data
-        else:
-            src_seq, ext_src_seq, src_len, trg_seq, ext_trg_seq, trg_len, _ = train_data
-            tag_seq = None
-        src_len = torch.tensor(src_len, dtype=torch.long)
-        enc_mask = (src_seq == 0).byte()
+        src_seq, ext_src_seq, trg_seq, ext_trg_seq, tag_seq, _ = train_data
+        enc_mask = torch.sign(src_seq)
+        src_len = torch.sum(enc_mask, 1)
 
         if config.use_gpu:
             src_seq = src_seq.to(config.device)
@@ -116,36 +117,35 @@ class Trainer(object):
             trg_seq = trg_seq.to(config.device)
             ext_trg_seq = ext_trg_seq.to(config.device)
             enc_mask = enc_mask.to(config.device)
-            if config.use_tag:
-                tag_seq = tag_seq.to(config.device)
-            else:
-                tag_seq = None
-
-        enc_outputs, enc_states = self.model.encoder(src_seq, src_len, tag_seq)
-        sos_trg = trg_seq[:, :-1]
+            tag_seq = tag_seq.to(config.device)
+            
+        
         eos_trg = trg_seq[:, 1:]
 
         if config.use_pointer:
             eos_trg = ext_trg_seq[:, 1:]
-        logits = self.model.decoder(sos_trg, ext_src_seq, enc_states, enc_outputs, enc_mask)
+        
+        logits = self.model(src_seq, tag_seq, ext_src_seq, trg_seq)
+        
         batch_size, nsteps, _ = logits.size()
         preds = logits.view(batch_size * nsteps, -1)
         targets = eos_trg.contiguous().view(-1)
         loss = self.criterion(preds, targets)
+        
         return loss
 
     def evaluate(self, msg):
-        self.model.eval_mode()
+        self.model.eval()
         num_val_batches = len(self.dev_loader)
         val_losses = []
         for i, val_data in enumerate(self.dev_loader, start=1):
             with torch.no_grad():
                 val_batch_loss = self.step(val_data)
                 val_losses.append(val_batch_loss.item())
-                msg2 = "{} => Evaluating :{}/{}".format(msg, i, num_val_batches)
+                msg2 = "{} => Evaluating :{}/{}".format(
+                    msg, i, num_val_batches)
                 print(msg2, end="\r")
-        # go back to train mode
-        self.model.train_mode()
+        
         val_loss = np.mean(val_losses)
 
         return val_loss

@@ -28,7 +28,7 @@ class SQuadDataset(data.Dataset):
 
         assert len(self.src) == len(self.trg), \
             "the number of source sequence {}" " and target sequence {} must be the same" \
-                .format(len(self.src), len(self.trg))
+            .format(len(self.src), len(self.trg))
 
         self.max_length = max_length
         self.word2idx = word2idx
@@ -42,8 +42,10 @@ class SQuadDataset(data.Dataset):
     def __getitem__(self, index):
         src_seq = self.src[index]
         trg_seq = self.trg[index]
-        src_seq, ext_src_seq, oov_lst = self.context2ids(src_seq, self.word2idx)
-        trg_seq, ext_trg_seq = self.question2ids(trg_seq, self.word2idx, oov_lst)
+        src_seq, ext_src_seq, oov_lst = self.context2ids(
+            src_seq, self.word2idx)
+        trg_seq, ext_trg_seq = self.question2ids(
+            trg_seq, self.word2idx, oov_lst)
         return src_seq, ext_src_seq, trg_seq, ext_trg_seq, oov_lst
 
     def __len__(self):
@@ -69,8 +71,8 @@ class SQuadDataset(data.Dataset):
         ids.append(word2idx[END_TOKEN])
         extended_ids.append(word2idx[END_TOKEN])
 
-        ids = torch.Tensor(ids)
-        extended_ids = torch.Tensor(extended_ids)
+        ids = torch.tensor(ids, dtype=torch.long)
+        extended_ids = torch.tensor(extended_ids, dtype=torch.long)
 
         return ids, extended_ids, oov_lst
 
@@ -107,17 +109,17 @@ def collate_fn(data):
         for i, seq in enumerate(sequences):
             end = lengths[i]
             padded_seqs[i, :end] = seq[:end]
-        return padded_seqs, lengths
+        return padded_seqs
 
     data.sort(key=lambda x: len(x[0]), reverse=True)
     src_seqs, ext_src_seqs, trg_seqs, ext_trg_seqs, oov_lst = zip(*data)
 
-    src_seqs, src_len = merge(src_seqs)
-    ext_src_seqs, _ = merge(ext_src_seqs)
-    trg_seqs, trg_len = merge(trg_seqs)
-    ext_trg_seqs, _ = merge(ext_trg_seqs)
+    src_seqs = merge(src_seqs)
+    ext_src_seqs = merge(ext_src_seqs)
+    trg_seqs = merge(trg_seqs)
+    ext_trg_seqs = merge(ext_trg_seqs)
 
-    return src_seqs, ext_src_seqs, src_len, trg_seqs, ext_trg_seqs, trg_len, oov_lst
+    return src_seqs, ext_src_seqs, trg_seqs, ext_trg_seqs, oov_lst
 
 
 class SQuadDatasetWithTag(data.Dataset):
@@ -150,7 +152,7 @@ class SQuadDatasetWithTag(data.Dataset):
 
         assert len(self.srcs) == len(self.trgs), \
             "the number of source sequence {}" " and target sequence {} must be the same" \
-                .format(len(self.srcs), len(self.trgs))
+            .format(len(self.srcs), len(self.trgs))
 
         self.max_length = max_length
         self.word2idx = word2idx
@@ -168,8 +170,10 @@ class SQuadDatasetWithTag(data.Dataset):
         tag_seq = self.tags[index]
 
         tag_seq = torch.Tensor(tag_seq[:self.max_length])
-        src_seq, ext_src_seq, oov_lst = self.context2ids(src_seq, self.word2idx)
-        trg_seq, ext_trg_seq = self.question2ids(trg_seq, self.word2idx, oov_lst)
+        src_seq, ext_src_seq, oov_lst = self.context2ids(
+            src_seq, self.word2idx)
+        trg_seq, ext_trg_seq = self.question2ids(
+            trg_seq, self.word2idx, oov_lst)
         return src_seq, ext_src_seq, trg_seq, ext_trg_seq, oov_lst, tag_seq
 
     def __len__(self):
@@ -230,38 +234,32 @@ def collate_fn_tag(data):
         for i, seq in enumerate(sequences):
             end = lengths[i]
             padded_seqs[i, :end] = seq[:end]
-        return padded_seqs, lengths
+        return padded_seqs
 
     data.sort(key=lambda x: len(x[0]), reverse=True)
-    src_seqs, ext_src_seqs, trg_seqs, ext_trg_seqs, oov_lst, tag_seqs = zip(*data)
+    src_seqs, ext_src_seqs, trg_seqs, ext_trg_seqs, oov_lst, tag_seqs = zip(
+        *data)
 
-    src_seqs, src_len = merge(src_seqs)
-    ext_src_seqs, _ = merge(ext_src_seqs)
-    trg_seqs, trg_len = merge(trg_seqs)
-    ext_trg_seqs, _ = merge(ext_trg_seqs)
-    tag_seqs, _ = merge(tag_seqs)
+    src_seqs = merge(src_seqs)
+    ext_src_seqs = merge(ext_src_seqs)
+    trg_seqs = merge(trg_seqs)
+    ext_trg_seqs = merge(ext_trg_seqs)
+    tag_seqs = merge(tag_seqs)
 
-    assert src_seqs.size(1) == tag_seqs.size(1), "length of tokens and tags should be equal"
+    assert src_seqs.size(1) == tag_seqs.size(
+        1), "length of tokens and tags should be equal"
 
-    return src_seqs, ext_src_seqs, src_len, trg_seqs, ext_trg_seqs, trg_len, tag_seqs, oov_lst
+    return src_seqs, ext_src_seqs, trg_seqs, ext_trg_seqs, tag_seqs, oov_lst
 
 
 def get_loader(src_file, trg_file, word2idx,
                batch_size, use_tag=False, debug=False, shuffle=False):
-    if use_tag:
-        dataset = SQuadDatasetWithTag(src_file, trg_file, config.max_seq_len,
-                                      word2idx, debug)
-        dataloader = data.DataLoader(dataset=dataset,
-                                     batch_size=batch_size,
-                                     shuffle=shuffle,
-                                     collate_fn=collate_fn_tag)
-    else:
-        dataset = SQuadDataset(src_file, trg_file, config.max_seq_len,
-                               word2idx, debug)
-        dataloader = data.DataLoader(dataset=dataset,
-                                     batch_size=batch_size,
-                                     shuffle=shuffle,
-                                     collate_fn=collate_fn)
+    dataset = SQuadDatasetWithTag(src_file, trg_file, config.max_len,
+                                  word2idx, debug)
+    dataloader = data.DataLoader(dataset=dataset,
+                                 batch_size=batch_size,
+                                 shuffle=shuffle,
+                                 collate_fn=collate_fn_tag)
 
     return dataloader
 
@@ -490,14 +488,16 @@ def process_file(file_name):
         articles = source["data"]
     for article in tqdm(articles):
         for para in article["paragraphs"]:
-            context = para["context"].replace("''", '" ').replace("``", '" ').lower()
+            context = para["context"].replace(
+                "''", '" ').replace("``", '" ').lower()
 
             context_tokens = word_tokenize(context)
             spans = convert_idx(context, context_tokens)
 
             for qa in para["qas"]:
                 total += 1
-                ques = qa["question"].replace("''", '" ').replace("``", '" ').lower()
+                ques = qa["question"].replace(
+                    "''", '" ').replace("``", '" ').lower()
                 ques_tokens = word_tokenize(ques)
 
                 for token in ques_tokens:

@@ -21,8 +21,8 @@ class QGEvalCap:
         output = []
         scorers = [
             (Bleu(4), ["Bleu_1", "Bleu_2", "Bleu_3", "Bleu_4"]),
-            (Meteor(),"METEOR"),
-            (Rouge(), "ROUGE_L"),
+            # (Meteor(),"METEOR"),
+            # (Rouge(), "ROUGE_L"),
             # (Cider(), "CIDEr")
         ]
 
@@ -92,9 +92,9 @@ def eval(out_file, src_file, tgt_file, isDIn = False, num_pairs = 500):
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("-out", "--out_file", dest="out_file", default="../result/bert_embeddings/unique_generated.txt", help="output file to compare")
-    parser.add_argument("-src", "--src_file", dest="src_file", default="../result/bert_embeddings/src.txt", help="src file")
-    parser.add_argument("-tgt", "--tgt_file", dest="tgt_file", default="../result/bert_embeddings/unique_golden.txt", help="target file")
+    parser.add_argument("-out", "--out_file", dest="out_file", default="../result/seq2seq/generated.txt", help="output file to compare")
+    parser.add_argument("-src", "--src_file", dest="src_file", default="../result/seq2seq/golden.txt", help="src file")
+    parser.add_argument("-tgt", "--tgt_file", dest="tgt_file", default="../result/seq2seq/golden.txt", help="target file")
     args = parser.parse_args()
 
     print("scores: \n")
