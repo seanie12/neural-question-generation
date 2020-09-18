@@ -51,8 +51,8 @@ class BeamSearcher(object):
         self.model.load_state_dict(state_dict)
         self.model.eval()
         self.moddel = self.model.to(config.device)
-        self.pred_dir = os.path.join(output_dir, "/generated.txt")
-        self.golden_dir = os.path.join(output_dir, "/golden.txt")
+        self.pred_dir = os.path.join(output_dir, "generated.txt")
+        self.golden_dir = os.path.join(output_dir, "golden.txt")
         self.src_file = os.path.join(output_dir, "src.txt")
         
         if not os.path.exists(output_dir):
